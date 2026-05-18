@@ -1,4 +1,4 @@
-"""
+R"""
 Telegram Spy Bot — Business API
 """
 
@@ -307,6 +307,34 @@ def handle_update(update: dict):
                         target_id = found["user_id"]
                     db.set_subscription(target_id, "banned", 0)
                     send(chat_id, f"🚫 Пользователь {target_id} забанен.")
+                    # Уведомляем забаненного
+                    try:
+                        send(target_id, "🚫 Ваш доступ к боту заблокирован.")
+                    except:
+                        pass
+                except Exception as e:
+                    send(chat_id, f"❌ Ошибка: {e}")
+
+        elif text.startswith("/unban ") and user_id == ADMIN_ID:
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    target = parts[1].lstrip("@")
+                    if target.isdigit():
+                        target_id = int(target)
+                    else:
+                        all_users = db.get_all_users()
+                        found = next((u for u in all_users if (u.get("username") or "").lower() == target.lower()), None)
+                        if not found:
+                            send(chat_id, f"❌ Пользователь @{target} не найден.")
+                            return
+                        target_id = found["user_id"]
+                    db.set_subscription(target_id, "trial", 14)
+                    send(chat_id, f"✅ Пользователь {target_id} разбанен, выдан trial на 14 дней.")
+                    try:
+                        send(target_id, "✅ Ваш доступ к боту восстановлен.")
+                    except:
+                        pass
                 except Exception as e:
                     send(chat_id, f"❌ Ошибка: {e}")
 
@@ -415,6 +443,11 @@ def handle_update(update: dict):
         new_text = msg.get("text", "")
 
         owner_id = db.get_owner_by_connection(conn_id) or ADMIN_ID
+
+        # Проверяем подписку
+        if not db.is_sub_active(owner_id):
+            return
+
         s = get_settings(owner_id)
         if not s["track_edited"]:
             return
@@ -436,6 +469,10 @@ def handle_update(update: dict):
         event = update["deleted_business_messages"]
         conn_id = event.get("business_connection_id", "")
         owner_id = db.get_owner_by_connection(conn_id) or ADMIN_ID
+
+        # Проверяем подписку
+        if not db.is_sub_active(owner_id):
+            return
 
         s = get_settings(owner_id)
         if not s["track_deleted"]:
