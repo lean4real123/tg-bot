@@ -405,10 +405,13 @@ def handle_update(update: dict):
 
         if text.startswith("/payments ") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=1)
-            if len(parts) < 2 or not parts[1].isdigit():
-                send(chat_id, "❌ Формат: /payments user_id")
+            if len(parts) < 2:
+                send(chat_id, "❌ Формат: /payments user_id или /payments @username")
                 return
-            target_id = int(parts[1])
+            target_id = resolve_user_identifier(parts[1])
+            if not target_id:
+                send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
+                return
             payments = db.get_payments_by_user(target_id, limit=10)
             if not payments:
                 send(chat_id, f"ℹ️ У пользователя {target_id} нет сохранённых платежей.")
@@ -454,10 +457,13 @@ def handle_update(update: dict):
 
         if text.startswith("/cancelsub ") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=1)
-            if len(parts) < 2 or not parts[1].isdigit():
-                send(chat_id, "❌ Формат: /cancelsub user_id")
+            if len(parts) < 2:
+                send(chat_id, "❌ Формат: /cancelsub user_id или /cancelsub @username")
                 return
-            target_id = int(parts[1])
+            target_id = resolve_user_identifier(parts[1])
+            if not target_id:
+                send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
+                return
             db.set_subscription(target_id, "expired", 0)
             send(chat_id, f"✅ Подписка пользователя {target_id} отменена.")
             try:
@@ -683,16 +689,16 @@ def handle_update(update: dict):
                 f"🕐 <b>Последние подключения:</b>{recent_text or ' нет'}\n\n"
                 f"<b>Команды:</b>\n\n"
                 f"/sub @user monthly|yearly|trial — выдать подписку\n"
-                f"/ban @user — забанить пользователя\n"
-                f"/unban @user — разбанить и дать 14 дней trial\n"
+                f"/ban user_id|@user — забанить пользователя\n"
+                f"/unban user_id|@user — разбанить и дать 14 дней trial\n"
                 f"/users — список пользователей\n"
                 f"/reply user_id текст — ответить в поддержку вручную\n"
                 f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
                 f"/refund user_id telegram_payment_charge_id — вернуть Stars\n"
-                f"/cancelsub user_id — отключить подписку без возврата\n"
-                f"/closesupport user_id — закрыть диалог поддержки\n"
+                f"/cancelsub user_id|@user — отключить подписку без возврата\n"
+                f"/closesupport user_id|@user — закрыть диалог поддержки\n"
                 f"/supportlist — активные диалоги поддержки\n"
-                f"/payments user_id — последние платежи пользователя\n"
+                f"/payments user_id|@user — последние платежи пользователя\n"
                 f"/admin"
             )
 
@@ -720,15 +726,10 @@ def handle_update(update: dict):
             parts = text.split()
             if len(parts) >= 2:
                 try:
-                    target = parts[1].lstrip("@")
-                    if target.isdigit():
-                        target_id = int(target)
-                    else:
-                        found = next((u for u in db.get_all_users() if (u.get("username") or "").lower() == target.lower()), None)
-                        if not found:
-                            send(chat_id, f"❌ @{target} не найден.")
-                            return
-                        target_id = found["user_id"]
+                    target_id = resolve_user_identifier(parts[1])
+                    if not target_id:
+                        send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
+                        return
                     db.set_subscription(target_id, "banned", 0)
                     send(chat_id, f"🚫 {target_id} забанен.")
                     try:
@@ -742,15 +743,10 @@ def handle_update(update: dict):
             parts = text.split()
             if len(parts) >= 2:
                 try:
-                    target = parts[1].lstrip("@")
-                    if target.isdigit():
-                        target_id = int(target)
-                    else:
-                        found = next((u for u in db.get_all_users() if (u.get("username") or "").lower() == target.lower()), None)
-                        if not found:
-                            send(chat_id, f"❌ @{target} не найден.")
-                            return
-                        target_id = found["user_id"]
+                    target_id = resolve_user_identifier(parts[1])
+                    if not target_id:
+                        send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
+                        return
                     db.set_subscription(target_id, "trial", 14)
                     send(chat_id, f"✅ {target_id} разбанен, trial 14 дней.")
                     try:
