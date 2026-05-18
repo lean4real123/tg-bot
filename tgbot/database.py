@@ -3,6 +3,7 @@
 """
 
 import sqlite3
+from datetime import datetime, timedelta
 
 DB_PATH = "spy.db"
 
@@ -13,9 +14,12 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
+            user_id         INTEGER PRIMARY KEY,
+            username        TEXT,
+            first_name      TEXT,
+            sub_type        TEXT DEFAULT 'trial',
+            sub_expires     TEXT,
+            created_at      TEXT DEFAULT (datetime('now'))
         )
     """)
 
@@ -41,7 +45,6 @@ def init_db():
         )
     """)
 
-    # Кэш медиа (голосовые, кружочки, аудио)
     c.execute("""
         CREATE TABLE IF NOT EXISTS media_cache (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,26 +65,68 @@ def init_db():
 
 # ── Пользователи ──────────────────────────────────────────
 
-def save_user(user_id: int, username: str):
+def save_user(user_id: int, username: str, first_name: str = ""):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # При первом сохранении даём trial на 3 дня
+    expires = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
     c.execute("""
-        INSERT INTO users (user_id, username)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
-    """, (user_id, username or ""))
+        INSERT INTO users (user_id, username, first_name, sub_type, sub_expires)
+        VALUES (?, ?, ?, 'trial', ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
+    """, (user_id, username or "", first_name or "", expires))
     conn.commit()
     conn.close()
+
+
+def get_user(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT * FROM users")
+    c.execute("SELECT * FROM users ORDER BY created_at DESC")
     rows = c.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def set_subscription(user_id: int, sub_type: str, days: int):
+    """Установить подписку пользователю"""
+    expires = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        UPDATE users SET sub_type = ?, sub_expires = ? WHERE user_id = ?
+    """, (sub_type, expires, user_id))
+    conn.commit()
+    conn.close()
+
+
+def is_sub_active(user_id: int) -> bool:
+    """Проверить активна ли подписка"""
+    user = get_user(user_id)
+    if not user:
+        return False
+    if user["sub_type"] == "banned":
+        return False
+    if not user["sub_expires"]:
+        return True  # бессрочная
+    try:
+        expires = datetime.strptime(user["sub_expires"], "%Y-%m-%d %H:%M")
+        return datetime.now() < expires
+    except Exception:
+        return False
 
 
 # ── Бизнес-подключения ────────────────────────────────────
@@ -118,13 +163,30 @@ def get_connections_count() -> int:
 
 
 def get_connections_count_for_user(user_id: int) -> int:
-    """Проверяем есть ли активное подключение у конкретного пользователя"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = ? AND is_enabled = 1", (user_id,))
     count = c.fetchone()[0]
     conn.close()
     return count
+
+
+def get_recent_connections(limit: int = 10):
+    """Последние подключения с инфо о пользователе"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT c.connection_id, c.owner_id, c.is_enabled, c.connected_at,
+               u.username, u.first_name, u.sub_type, u.sub_expires
+        FROM connections c
+        LEFT JOIN users u ON c.owner_id = u.user_id
+        ORDER BY c.connected_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ── Кэш текстовых сообщений ───────────────────────────────

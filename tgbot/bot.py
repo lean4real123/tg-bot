@@ -106,7 +106,12 @@ def get_user_link(user: dict) -> str:
         name += " " + user["last_name"]
     name = name.strip() or "Неизвестный"
     uid = user.get("id")
-    if uid:
+    username = user.get("username")
+    if username:
+        # Если есть username — ссылка через @username (всегда работает)
+        return f'<a href="https://t.me/{username}">{name} (@{username})</a>'
+    elif uid:
+        # Если нет username — ссылка через tg://user?id=
         return f'<a href="tg://user?id={uid}">{name}</a>'
     return name
 
@@ -116,8 +121,11 @@ def get_chat_link(chat: dict) -> str:
     if chat.get("last_name"):
         name += " " + chat["last_name"]
     name = name.strip() or "Неизвестный"
+    username = chat.get("username")
     cid = chat.get("id")
-    if cid:
+    if username:
+        return f'<a href="https://t.me/{username}">{name} (@{username})</a>'
+    elif cid:
         return f'<a href="tg://user?id={cid}">{name}</a>'
     return name
 
@@ -133,7 +141,7 @@ def handle_update(update: dict):
         chat_id = msg["chat"]["id"]
         user_id = user.get("id")
 
-        db.save_user(user_id, user.get("username", ""))
+        db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
 
         if text == "/start":
@@ -209,22 +217,96 @@ def handle_update(update: dict):
 
         elif text in ("📖 Инструкция", "Инструкция"):
             send(chat_id,
-                "⚙️ <b>Инструкция:</b>\n\n"
-                "1️⃣ Открой профиль в Telegram\n"
+                "⚙️ <b>Как подключить бота:</b>\n\n"
+                "<b>Способ 1 — Новая версия Telegram (рекомендуется):</b>\n"
+                "1️⃣ Открой свой профиль\n"
                 "2️⃣ Нажми <b>Изм.</b> (карандаш)\n"
-                "3️⃣ Найди <b>Автоматизация чатов</b>\n"
+                "3️⃣ Прокрути вниз → <b>Автоматизация чатов</b>\n"
                 "4️⃣ Введи <code>@DialogDelete123Bot</code> → <b>Добавить</b>\n\n"
-                "✅ После подключения уведомления придут сюда.\n\n"
-                "⚠️ <i>Требуется актуальная версия Telegram</i>",
+                "<b>Способ 2 — Telegram Premium (старая версия):</b>\n"
+                "1️⃣ Настройки Telegram\n"
+                "2️⃣ <b>Telegram для бизнеса</b>\n"
+                "3️⃣ <b>Чат-боты</b>\n"
+                "4️⃣ Введи <code>@DialogDelete123Bot</code> → <b>Добавить</b>\n\n"
+                "✅ После подключения уведомления будут приходить сюда.\n\n"
+                "⚠️ <i>Если раздел не появляется — обнови Telegram до последней версии</i>",
                 keyboard=main_keyboard()
             )
 
         elif text == "/admin" and user_id == ADMIN_ID:
             users = db.get_all_users()
             connections = db.get_connections_count()
+            active = sum(1 for u in users if db.is_sub_active(u["user_id"]))
+            trial = sum(1 for u in users if u["sub_type"] == "trial")
+            paid = sum(1 for u in users if u["sub_type"] in ("monthly", "yearly"))
+            banned = sum(1 for u in users if u["sub_type"] == "banned")
+
+            # Последние 5 подключений
+            recent = db.get_recent_connections(5)
+            recent_text = ""
+            for r in recent:
+                name = r.get("first_name") or r.get("username") or str(r["owner_id"])
+                uname = f"@{r['username']}" if r.get("username") else f"id:{r['owner_id']}"
+                status = "🟢" if r["is_enabled"] else "🔴"
+                sub = r.get("sub_type", "?")
+                date = (r.get("connected_at") or "")[:16]
+                recent_text += f"\n{status} {name} ({uname}) · {sub} · {date}"
+
             send(chat_id,
-                f"👑 <b>Админ</b>\n\nПользователей: {len(users)}\nПодключений: {connections}"
+                f"👑 <b>Админ панель</b>\n\n"
+                f"👥 Всего пользователей: {len(users)}\n"
+                f"🔗 Активных подключений: {connections}\n\n"
+                f"📊 <b>Подписки:</b>\n"
+                f"🆓 Trial: {trial}\n"
+                f"💳 Платных: {paid}\n"
+                f"🚫 Забанено: {banned}\n\n"
+                f"🕐 <b>Последние подключения:</b>"
+                f"{recent_text or ' нет данных'}\n\n"
+                f"<b>Команды:</b>\n"
+                f"/sub [id] [monthly/yearly/trial] — выдать подписку\n"
+                f"/ban [id] — забанить\n"
+                f"/users — список всех пользователей"
             )
+
+        elif text.startswith("/sub ") and user_id == ADMIN_ID:
+            parts = text.split()
+            if len(parts) >= 3:
+                try:
+                    target_id = int(parts[1])
+                    sub_type = parts[2]
+                    days = {"trial": 3, "monthly": 30, "yearly": 365}.get(sub_type, 30)
+                    db.set_subscription(target_id, sub_type, days)
+                    send(chat_id, f"✅ Подписка <b>{sub_type}</b> выдана пользователю {target_id} на {days} дней.")
+                except Exception as e:
+                    send(chat_id, f"❌ Ошибка: {e}\nФормат: /sub [user_id] [monthly/yearly/trial]")
+            else:
+                send(chat_id, "Формат: /sub [user_id] [monthly/yearly/trial]")
+
+        elif text.startswith("/ban ") and user_id == ADMIN_ID:
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    target_id = int(parts[1])
+                    db.set_subscription(target_id, "banned", 0)
+                    send(chat_id, f"🚫 Пользователь {target_id} забанен.")
+                except Exception as e:
+                    send(chat_id, f"❌ Ошибка: {e}")
+
+        elif text == "/users" and user_id == ADMIN_ID:
+            users = db.get_all_users()
+            if not users:
+                send(chat_id, "Нет пользователей.")
+                return
+            text_out = "👥 <b>Все пользователи:</b>\n\n"
+            for u in users[:20]:  # максимум 20
+                name = u.get("first_name") or u.get("username") or str(u["user_id"])
+                uname = f"@{u['username']}" if u.get("username") else f"id:{u['user_id']}"
+                sub = u.get("sub_type", "?")
+                expires = (u.get("sub_expires") or "")[:10]
+                active = "✅" if db.is_sub_active(u["user_id"]) else "❌"
+                connected = "🔗" if db.get_connections_count_for_user(u["user_id"]) else "  "
+                text_out += f"{active}{connected} {name} ({uname})\n    {sub} до {expires}\n\n"
+            send(chat_id, text_out)
 
     # ── Подключение бизнес-аккаунта ───────────────────────
     elif "business_connection" in update:
