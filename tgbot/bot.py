@@ -19,8 +19,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Цены в Telegram Stars
-PRICE_MONTHLY = 150
-PRICE_YEARLY = 1200
+PRICE_WEEKLY = 45
+PRICE_MONTHLY = 100
+PRICE_YEARLY = 320
 
 ALLOWED_UPDATES = [
     "message",
@@ -111,6 +112,7 @@ def send_expired_message(user_id: int):
         "💳 <b>Или купи подписку за Telegram Stars:</b>",
         keyboard={
             "inline_keyboard": [
+                [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
                 [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
                 [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
                 [{"text": "👥 Пригласить друга", "url": ref_link}],
@@ -182,7 +184,10 @@ def handle_update(update: dict):
         msg = update["message"]
         user_id = msg["from"]["id"]
         payload = msg["successful_payment"].get("invoice_payload", "")
-        if payload == "monthly":
+        if payload == "weekly":
+            db.set_subscription(user_id, "weekly", 7)
+            send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>7 дней</b> активирована.", keyboard=main_keyboard())
+        elif payload == "monthly":
             db.set_subscription(user_id, "monthly", 30)
             send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>30 дней</b> активирована.", keyboard=main_keyboard())
         elif payload == "yearly":
@@ -266,11 +271,13 @@ def handle_update(update: dict):
         elif text in ("💳 Купить подписку",):
             send(chat_id,
                 f"💳 <b>Купить подписку</b>\n\n"
+                f"⭐ 7 дней — {PRICE_WEEKLY} Telegram Stars\n"
                 f"⭐ 30 дней — {PRICE_MONTHLY} Telegram Stars\n"
                 f"⭐ 365 дней — {PRICE_YEARLY} Telegram Stars\n\n"
                 "Оплата через Telegram Stars — мгновенно и безопасно.",
                 keyboard={
                     "inline_keyboard": [
+                        [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
                         [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
                         [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
                     ]
@@ -422,9 +429,11 @@ def handle_update(update: dict):
                     link = f'<a href="tg://user?id={uid}">{name}</a>'
                 sub = u.get("sub_type", "?")
                 exp = str(u.get("sub_expires") or "")[:10]
-                icon = "✅" if db.is_sub_active(uid) else "❌"
-                conn_icon = "🔗" if db.get_connections_count_for_user(uid) else "  "
-                text_out += f"{icon}{conn_icon} {link} (id:{uid})\n    {sub} до {exp}\n\n"
+                sub_icon = "✅" if db.is_sub_active(uid) else "❌"
+                # 🔗 = подключён, ➖ = отключён
+                conn_count = db.get_connections_count_for_user(uid)
+                conn_icon = "🔗" if conn_count else "➖"
+                text_out += f"{sub_icon}{conn_icon} {link} (id:{uid})\n    {sub} до {exp}\n\n"
             send(chat_id, text_out)
 
     # ── Callback кнопки ────────────────────────────────────
@@ -434,7 +443,9 @@ def handle_update(update: dict):
         data = cq.get("data", "")
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data == "buy_monthly":
+        if data == "buy_weekly":
+            send_invoice(user_id, "Подписка 7 дней", "Dialog Spy Bot — 7 дней доступа", "weekly", PRICE_WEEKLY)
+        elif data == "buy_monthly":
             send_invoice(user_id, "Подписка 30 дней", "Dialog Spy Bot — 30 дней доступа", "monthly", PRICE_MONTHLY)
         elif data == "buy_yearly":
             send_invoice(user_id, "Подписка 365 дней", "Dialog Spy Bot — 365 дней доступа", "yearly", PRICE_YEARLY)
