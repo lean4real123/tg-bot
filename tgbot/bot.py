@@ -8,11 +8,13 @@ import time
 import logging
 import sys
 import os
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 sys.path.insert(0, os.path.dirname(__file__))
 import database as db
-from config import BOT_TOKEN, ADMIN_ID
+from config import BOT_TOKEN, ADMIN_ID, PORT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
@@ -21,7 +23,7 @@ BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # Цены в Telegram Stars
 PRICE_WEEKLY = 45
 PRICE_MONTHLY = 100
-PRICE_YEARLY = 320
+PRICE_YEARLY = 550
 
 ALLOWED_UPDATES = [
     "message",
@@ -35,6 +37,30 @@ ALLOWED_UPDATES = [
 
 user_settings: dict = {}
 BOT_USERNAME = ""
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logging.info(f"Healthcheck server started on port {PORT}")
 
 
 def get_settings(user_id: int) -> dict:
@@ -559,7 +585,15 @@ def handle_update(update: dict):
 
 def main():
     global BOT_USERNAME
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL is not set")
+
     db.init_db()
+    start_health_server()
+
+    api("deleteWebhook", drop_pending_updates=False)
 
     me = api("getMe")
     BOT_USERNAME = me.get("result", {}).get("username", "DialogDelBot")
@@ -571,7 +605,7 @@ def main():
     offset = 0
     while True:
         try:
-            result = api("getUpdates", offset=offset, timeout=0, allowed_updates=ALLOWED_UPDATES)
+            result = api("getUpdates", offset=offset, timeout=50, allowed_updates=ALLOWED_UPDATES)
             if not result.get("ok"):
                 time.sleep(5)
                 continue
