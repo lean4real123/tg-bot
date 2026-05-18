@@ -1,6 +1,4 @@
-"""
-Telegram Spy Bot — Business API
-"""
+"""Telegram Spy Bot for Telegram Business API."""
 
 import urllib.request
 import json
@@ -11,6 +9,7 @@ import os
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 import database as db
@@ -20,10 +19,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Цены в Telegram Stars
+# Prices in Telegram Stars
 PRICE_WEEKLY = 45
 PRICE_MONTHLY = 100
 PRICE_YEARLY = 550
+PAYMENT_PLANS = {
+    "weekly": {"days": 7, "stars": PRICE_WEEKLY, "title": "Подписка 7 дней"},
+    "monthly": {"days": 30, "stars": PRICE_MONTHLY, "title": "Подписка 30 дней"},
+    "yearly": {"days": 365, "stars": PRICE_YEARLY, "title": "Подписка 365 дней"},
+}
 
 ALLOWED_UPDATES = [
     "message",
@@ -35,8 +39,20 @@ ALLOWED_UPDATES = [
     "pre_checkout_query",
 ]
 
-user_settings: dict = {}
 BOT_USERNAME = ""
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def format_ts_msk(unix_ts: int) -> str:
+    return datetime.fromtimestamp(unix_ts, MSK).strftime("%d.%m.%Y %H:%M")
+
+
+def format_db_date(value) -> str:
+    if not value:
+        return "—"
+    if isinstance(value, str):
+        return value[:10]
+    return value.strftime("%d.%m.%Y")
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -64,9 +80,7 @@ def start_health_server():
 
 
 def get_settings(user_id: int) -> dict:
-    if user_id not in user_settings:
-        user_settings[user_id] = {"track_deleted": True, "track_edited": True}
-    return user_settings[user_id]
+    return db.get_user_settings(user_id)
 
 
 def api(method, **params):
@@ -76,7 +90,10 @@ def api(method, **params):
                                   headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
+            response = json.loads(r.read())
+            if not response.get("ok"):
+                logging.error("Telegram API returned error for %s: %s", method, response)
+            return response
     except Exception as e:
         logging.error(f"API error {method}: {e}")
         return {"ok": False}
@@ -86,11 +103,14 @@ def send(chat_id, text, keyboard=None):
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if keyboard:
         params["reply_markup"] = keyboard
-    api("sendMessage", **params)
+    result = api("sendMessage", **params)
+    if not result.get("ok"):
+        logging.error("sendMessage failed for chat_id=%s", chat_id)
+    return result
 
 
 def send_invoice(chat_id: int, title: str, description: str, payload: str, amount: int):
-    api("sendInvoice",
+    result = api("sendInvoice",
         chat_id=chat_id,
         title=title,
         description=description,
@@ -98,6 +118,9 @@ def send_invoice(chat_id: int, title: str, description: str, payload: str, amoun
         currency="XTR",
         prices=[{"label": title, "amount": amount}]
     )
+    if not result.get("ok"):
+        logging.error("sendInvoice failed for chat_id=%s payload=%s amount=%s", chat_id, payload, amount)
+    return result
 
 
 def send_file(chat_id, file_id, file_type, caption=""):
@@ -112,7 +135,7 @@ def send_file(chat_id, file_id, file_type, caption=""):
     }
     method = method_map.get(file_type, "sendDocument")
     if file_type in ("video_note", "sticker"):
-        api(method, **{"chat_id": chat_id, file_type: file_id})
+        result = api(method, **{"chat_id": chat_id, file_type: file_id})
         if caption:
             send(chat_id, caption)
     else:
@@ -120,7 +143,28 @@ def send_file(chat_id, file_id, file_type, caption=""):
         if caption:
             params["caption"] = caption
             params["parse_mode"] = "HTML"
-        api(method, **params)
+        result = api(method, **params)
+    if not result.get("ok"):
+        logging.error("send_file failed for chat_id=%s file_type=%s", chat_id, file_type)
+    return result
+
+
+def get_support_media(msg: dict):
+    if msg.get("photo"):
+        return "photo", msg["photo"][-1]["file_id"]
+    if msg.get("document"):
+        return "document", msg["document"]["file_id"]
+    if msg.get("video"):
+        return "video", msg["video"]["file_id"]
+    if msg.get("voice"):
+        return "voice", msg["voice"]["file_id"]
+    if msg.get("audio"):
+        return "audio", msg["audio"]["file_id"]
+    if msg.get("video_note"):
+        return "video_note", msg["video_note"]["file_id"]
+    if msg.get("sticker"):
+        return "sticker", msg["sticker"]["file_id"]
+    return None, None
 
 
 def get_ref_link(user_id: int) -> str:
@@ -153,6 +197,7 @@ def main_keyboard():
             [{"text": "📊 Статус"}, {"text": "⚙️ Настройки"}],
             [{"text": "📖 Инструкция"}, {"text": "🔒 Приватность"}],
             [{"text": "💳 Купить подписку"}, {"text": "👥 Пригласить друга"}],
+            [{"text": "💬 Поддержка"}],
         ],
         "resize_keyboard": True
     }
@@ -210,15 +255,17 @@ def handle_update(update: dict):
         msg = update["message"]
         user_id = msg["from"]["id"]
         payload = msg["successful_payment"].get("invoice_payload", "")
-        if payload == "weekly":
-            db.set_subscription(user_id, "weekly", 7)
-            send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>7 дней</b> активирована.", keyboard=main_keyboard())
-        elif payload == "monthly":
-            db.set_subscription(user_id, "monthly", 30)
-            send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>30 дней</b> активирована.", keyboard=main_keyboard())
-        elif payload == "yearly":
-            db.set_subscription(user_id, "yearly", 365)
-            send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>365 дней</b> активирована.", keyboard=main_keyboard())
+        plan = PAYMENT_PLANS.get(payload)
+        if not plan:
+            logging.error("Unknown successful payment payload: %s", payload)
+            send(user_id, "❌ Не удалось определить оплаченный тариф. Напиши в поддержку.")
+            return
+        db.set_subscription(user_id, payload, plan["days"])
+        send(
+            user_id,
+            f"✅ <b>Оплата прошла!</b>\nПодписка на <b>{plan['days']} дней</b> активирована.",
+            keyboard=main_keyboard(),
+        )
         return
 
     # ── Обычное сообщение боту ─────────────────────────────
@@ -231,6 +278,52 @@ def handle_update(update: dict):
 
         db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
+
+        if text == "/cancel":
+            if s.get("support_mode"):
+                s["support_mode"] = False
+                db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
+                send(chat_id, "✅ Режим обращения в поддержку выключен.", keyboard=main_keyboard())
+            else:
+                send(chat_id, "ℹ️ Сейчас режим поддержки не активен.", keyboard=main_keyboard())
+            return
+
+        if text.startswith("/reply ") and user_id == ADMIN_ID:
+            parts = text.split(maxsplit=2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                send(chat_id, "❌ Формат: /reply user_id текст")
+                return
+            target_id = int(parts[1])
+            reply_text = parts[2].strip()
+            send(target_id, f"💬 <b>Ответ поддержки</b>\n\n{reply_text}", keyboard=main_keyboard())
+            send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
+            return
+
+        if s.get("support_mode") and user_id != ADMIN_ID:
+            username = user.get("username")
+            first_name = user.get("first_name") or "Без имени"
+            media_type, media_file_id = get_support_media(msg)
+            message_body = text or msg.get("caption") or "[не текстовое сообщение]"
+            header = (
+                f"💬 <b>Новое обращение в поддержку</b>\n\n"
+                f"👤 Пользователь: {first_name}\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"{'🔗 @' + username if username else '🔗 username не указан'}\n\n"
+                f"<b>Сообщение:</b>\n{message_body}"
+            )
+            if media_type and media_file_id:
+                send_file(ADMIN_ID, media_file_id, media_type, header)
+            else:
+                send(ADMIN_ID, header)
+            s["support_mode"] = False
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
+            send(
+                chat_id,
+                "✅ Сообщение отправлено в поддержку. Ответ придёт сюда.\n\n"
+                "Если нужно написать ещё раз, снова нажми кнопку «💬 Поддержка».",
+                keyboard=main_keyboard(),
+            )
+            return
 
         # Реферальная ссылка
         if text.startswith("/start ref_"):
@@ -266,7 +359,7 @@ def handle_update(update: dict):
             sub_active = db.is_sub_active(user_id)
             user_data = db.get_user(user_id)
             sub_type = user_data.get("sub_type", "trial") if user_data else "trial"
-            sub_expires = str(user_data.get("sub_expires", ""))[:10] if user_data else "—"
+            sub_expires = format_db_date(user_data.get("sub_expires")) if user_data else "—"
             del_icon = "✅" if s["track_deleted"] else "❌"
             edit_icon = "✅" if s["track_edited"] else "❌"
             send(chat_id,
@@ -285,10 +378,12 @@ def handle_update(update: dict):
 
         elif "Удалённые сообщения" in text:
             s["track_deleted"] = not s["track_deleted"]
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s.get("support_mode", False))
             send(chat_id, f"Удалённые сообщения: {'✅' if s['track_deleted'] else '❌'}", keyboard=settings_keyboard(user_id))
 
         elif "Изменённые сообщения" in text:
             s["track_edited"] = not s["track_edited"]
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s.get("support_mode", False))
             send(chat_id, f"Изменённые сообщения: {'✅' if s['track_edited'] else '❌'}", keyboard=settings_keyboard(user_id))
 
         elif text == "◀️ Назад":
@@ -321,6 +416,17 @@ def handle_update(update: dict):
                 f"Твоя ссылка:\n<code>{ref_link}</code>\n\n"
                 f"Приглашено друзей: <b>{ref_count}</b>",
                 keyboard={"inline_keyboard": [[{"text": "📤 Поделиться", "url": share_url}]]}
+            )
+
+        elif text in ("💬 Поддержка",):
+            s["support_mode"] = True
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
+            send(
+                chat_id,
+                "💬 <b>Поддержка</b>\n\n"
+                "Напиши одним сообщением, что случилось.\n"
+                "Можно отправить текст, и я перешлю его админу.\n\n"
+                "Для отмены отправь <code>/cancel</code>",
             )
 
         elif text in ("🔒 Приватность",):
@@ -362,7 +468,8 @@ def handle_update(update: dict):
                 uname = f"@{r['username']}" if r.get("username") else f"id:{r['owner_id']}"
                 icon = "🟢" if r["is_enabled"] else "🔴"
                 sub = r.get("sub_type", "?")
-                date = str(r.get("connected_at") or "")[:16]
+                raw_date = r.get("connected_at")
+                date = raw_date.strftime("%d.%m.%Y %H:%M") if raw_date else ""
                 recent_text += f"\n{icon} {name} ({uname}) · {sub} · {date}"
             send(chat_id,
                 f"👑 <b>Админ панель</b>\n\n"
@@ -373,7 +480,9 @@ def handle_update(update: dict):
                 f"<b>Команды:</b>\n"
                 f"/sub @user monthly|yearly|trial\n"
                 f"/ban @user | /unban @user\n"
-                f"/users"
+                f"/users\n"
+                f"/reply user_id текст\n"
+                f"/admin"
             )
 
         elif text.startswith("/sub ") and user_id == ADMIN_ID:
@@ -454,7 +563,7 @@ def handle_update(update: dict):
                 else:
                     link = f'<a href="tg://user?id={uid}">{name}</a>'
                 sub = u.get("sub_type", "?")
-                exp = str(u.get("sub_expires") or "")[:10]
+                exp = format_db_date(u.get("sub_expires"))
                 sub_icon = "✅" if db.is_sub_active(uid) else "❌"
                 # 🔗 = подключён, ➖ = отключён
                 conn_count = db.get_connections_count_for_user(uid)
@@ -470,15 +579,39 @@ def handle_update(update: dict):
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
         if data == "buy_weekly":
-            send_invoice(user_id, "Подписка 7 дней", "Dialog Spy Bot — 7 дней доступа", "weekly", PRICE_WEEKLY)
+            plan = PAYMENT_PLANS["weekly"]
+            send_invoice(user_id, plan["title"], "Dialog Spy Bot — 7 дней доступа", "weekly", plan["stars"])
         elif data == "buy_monthly":
-            send_invoice(user_id, "Подписка 30 дней", "Dialog Spy Bot — 30 дней доступа", "monthly", PRICE_MONTHLY)
+            plan = PAYMENT_PLANS["monthly"]
+            send_invoice(user_id, plan["title"], "Dialog Spy Bot — 30 дней доступа", "monthly", plan["stars"])
         elif data == "buy_yearly":
-            send_invoice(user_id, "Подписка 365 дней", "Dialog Spy Bot — 365 дней доступа", "yearly", PRICE_YEARLY)
+            plan = PAYMENT_PLANS["yearly"]
+            send_invoice(user_id, plan["title"], "Dialog Spy Bot — 365 дней доступа", "yearly", plan["stars"])
 
     # ── Pre-checkout ───────────────────────────────────────
     elif "pre_checkout_query" in update:
         pcq = update["pre_checkout_query"]
+        payload = pcq.get("invoice_payload", "")
+        plan = PAYMENT_PLANS.get(payload)
+        amount = pcq.get("total_amount")
+        if not plan:
+            logging.error("Invalid pre_checkout payload: %s", payload)
+            api(
+                "answerPreCheckoutQuery",
+                pre_checkout_query_id=pcq["id"],
+                ok=False,
+                error_message="Неизвестный тариф. Попробуй создать счёт заново.",
+            )
+            return
+        if amount != plan["stars"]:
+            logging.error("Invalid pre_checkout amount for %s: got=%s expected=%s", payload, amount, plan["stars"])
+            api(
+                "answerPreCheckoutQuery",
+                pre_checkout_query_id=pcq["id"],
+                ok=False,
+                error_message="Сумма счёта изменилась. Попробуй создать счёт заново.",
+            )
+            return
         api("answerPreCheckoutQuery", pre_checkout_query_id=pcq["id"], ok=True)
 
     # ── Подключение бизнес-аккаунта ───────────────────────
@@ -502,7 +635,7 @@ def handle_update(update: dict):
         if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
 
-        date_str = datetime.fromtimestamp(msg["date"]).strftime("%d.%m.%Y %H:%M")
+        date_str = format_ts_msk(msg["date"])
         sender_link = get_user_link(sender)
 
         if msg.get("text"):

@@ -1,13 +1,17 @@
-"""
-База данных на PostgreSQL
-"""
+"""PostgreSQL helpers for the bot."""
 
 import os
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def now_msk() -> datetime:
+    return datetime.now(MSK).replace(tzinfo=None)
 
 
 def get_conn():
@@ -74,6 +78,21 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id         BIGINT PRIMARY KEY,
+            track_deleted   BOOLEAN DEFAULT TRUE,
+            track_edited    BOOLEAN DEFAULT TRUE,
+            support_mode    BOOLEAN DEFAULT FALSE,
+            updated_at      TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    c.execute("""
+        ALTER TABLE user_settings
+        ADD COLUMN IF NOT EXISTS support_mode BOOLEAN DEFAULT FALSE
+    """)
+
     conn.commit()
     conn.close()
 
@@ -81,7 +100,7 @@ def init_db():
 # ── Пользователи ──────────────────────────────────────────
 
 def save_user(user_id: int, username: str, first_name: str = ""):
-    expires = datetime.now() + timedelta(days=14)
+    expires = now_msk() + timedelta(days=14)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -115,9 +134,9 @@ def get_all_users():
 
 def set_subscription(user_id: int, sub_type: str, days: int):
     if days > 0:
-        expires = datetime.now() + timedelta(days=days)
+        expires = now_msk() + timedelta(days=days)
     else:
-        expires = datetime.now()
+        expires = now_msk()
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -133,7 +152,10 @@ def add_days(user_id: int, days: int):
     c = conn.cursor()
     c.execute("""
         UPDATE users SET
-            sub_expires = GREATEST(COALESCE(sub_expires, NOW()), NOW()) + (%s || ' days')::INTERVAL
+            sub_expires = GREATEST(
+                COALESCE(sub_expires, timezone('Europe/Moscow', NOW())),
+                timezone('Europe/Moscow', NOW())
+            ) + (%s || ' days')::INTERVAL
         WHERE user_id = %s AND sub_type != 'banned'
     """, (str(days), user_id))
     conn.commit()
@@ -151,7 +173,42 @@ def is_sub_active(user_id: int) -> bool:
     expires = user["sub_expires"]
     if isinstance(expires, str):
         expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
-    return datetime.now() < expires
+    return now_msk() < expires
+
+
+def get_user_settings(user_id: int):
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c.execute("""
+        INSERT INTO user_settings (user_id)
+        VALUES (%s)
+        ON CONFLICT (user_id) DO NOTHING
+    """, (user_id,))
+    c.execute("""
+        SELECT track_deleted, track_edited, support_mode
+        FROM user_settings
+        WHERE user_id = %s
+    """, (user_id,))
+    row = c.fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row) if row else {"track_deleted": True, "track_edited": True, "support_mode": False}
+
+
+def save_user_settings(user_id: int, track_deleted: bool, track_edited: bool, support_mode: bool = False):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO user_settings (user_id, track_deleted, track_edited, support_mode, updated_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+            track_deleted = EXCLUDED.track_deleted,
+            track_edited = EXCLUDED.track_edited,
+            support_mode = EXCLUDED.support_mode,
+            updated_at = NOW()
+    """, (user_id, track_deleted, track_edited, support_mode))
+    conn.commit()
+    conn.close()
 
 
 # ── Бизнес-подключения ────────────────────────────────────
