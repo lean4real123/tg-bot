@@ -353,8 +353,14 @@ def handle_update(update: dict):
         sender = msg.get("from", {})
         owner_id = db.get_owner_by_connection(conn_id) or ADMIN_ID
 
-        # Не кэшируем свои сообщения
+        # Кэшируем только входящие сообщения (от собеседника, не от владельца)
+        # chat.id == собеседник, sender.id == кто написал
+        # Если отправитель — сам владелец, пропускаем
         if sender.get("id") == owner_id:
+            return
+
+        # Также пропускаем если чат — это сам владелец (исходящие)
+        if msg["chat"]["id"] == owner_id:
             return
 
         date_str = datetime.fromtimestamp(msg["date"]).strftime("%d.%m.%Y %H:%M")
