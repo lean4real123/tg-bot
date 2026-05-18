@@ -68,8 +68,8 @@ def init_db():
 def save_user(user_id: int, username: str, first_name: str = ""):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # При первом сохранении даём trial на 3 дня
-    expires = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
+    # При первом сохранении даём trial на 14 дней
+    expires = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d %H:%M")
     c.execute("""
         INSERT INTO users (user_id, username, first_name, sub_type, sub_expires)
         VALUES (?, ?, ?, 'trial', ?)

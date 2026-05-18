@@ -272,21 +272,39 @@ def handle_update(update: dict):
             parts = text.split()
             if len(parts) >= 3:
                 try:
-                    target_id = int(parts[1])
+                    target = parts[1].lstrip("@")
                     sub_type = parts[2]
-                    days = {"trial": 3, "monthly": 30, "yearly": 365}.get(sub_type, 30)
+                    days = {"trial": 14, "monthly": 30, "yearly": 365}.get(sub_type, 30)
+                    if target.isdigit():
+                        target_id = int(target)
+                    else:
+                        all_users = db.get_all_users()
+                        found = next((u for u in all_users if (u.get("username") or "").lower() == target.lower()), None)
+                        if not found:
+                            send(chat_id, f"❌ Пользователь @{target} не найден.")
+                            return
+                        target_id = found["user_id"]
                     db.set_subscription(target_id, sub_type, days)
-                    send(chat_id, f"✅ Подписка <b>{sub_type}</b> выдана пользователю {target_id} на {days} дней.")
+                    send(chat_id, f"✅ Подписка <b>{sub_type}</b> выдана {target_id} на {days} дней.")
                 except Exception as e:
-                    send(chat_id, f"❌ Ошибка: {e}\nФормат: /sub [user_id] [monthly/yearly/trial]")
+                    send(chat_id, f"❌ Ошибка: {e}\nФормат: /sub [id или @username] [monthly/yearly/trial]")
             else:
-                send(chat_id, "Формат: /sub [user_id] [monthly/yearly/trial]")
+                send(chat_id, "Формат: /sub [id или @username] [monthly/yearly/trial]")
 
         elif text.startswith("/ban ") and user_id == ADMIN_ID:
             parts = text.split()
             if len(parts) >= 2:
                 try:
-                    target_id = int(parts[1])
+                    target = parts[1].lstrip("@")
+                    if target.isdigit():
+                        target_id = int(target)
+                    else:
+                        all_users = db.get_all_users()
+                        found = next((u for u in all_users if (u.get("username") or "").lower() == target.lower()), None)
+                        if not found:
+                            send(chat_id, f"❌ Пользователь @{target} не найден.")
+                            return
+                        target_id = found["user_id"]
                     db.set_subscription(target_id, "banned", 0)
                     send(chat_id, f"🚫 Пользователь {target_id} забанен.")
                 except Exception as e:
@@ -298,14 +316,18 @@ def handle_update(update: dict):
                 send(chat_id, "Нет пользователей.")
                 return
             text_out = "👥 <b>Все пользователи:</b>\n\n"
-            for u in users[:20]:  # максимум 20
+            for u in users[:20]:
                 name = u.get("first_name") or u.get("username") or str(u["user_id"])
-                uname = f"@{u['username']}" if u.get("username") else f"id:{u['user_id']}"
+                uid = u["user_id"]
+                if u.get("username"):
+                    uname_link = f'<a href="https://t.me/{u["username"]}">@{u["username"]}</a>'
+                else:
+                    uname_link = f'<a href="tg://user?id={uid}">{name}</a>'
                 sub = u.get("sub_type", "?")
                 expires = (u.get("sub_expires") or "")[:10]
-                active = "✅" if db.is_sub_active(u["user_id"]) else "❌"
-                connected = "🔗" if db.get_connections_count_for_user(u["user_id"]) else "  "
-                text_out += f"{active}{connected} {name} ({uname})\n    {sub} до {expires}\n\n"
+                active_icon = "✅" if db.is_sub_active(uid) else "❌"
+                connected = "🔗" if db.get_connections_count_for_user(uid) else "  "
+                text_out += f"{active_icon}{connected} {uname_link} (id:{uid})\n    {sub} до {expires}\n\n"
             send(chat_id, text_out)
 
     # ── Подключение бизнес-аккаунта ───────────────────────
