@@ -28,6 +28,18 @@ PAYMENT_PLANS = {
     "monthly": {"days": 30, "stars": PRICE_MONTHLY, "title": "Подписка 30 дней"},
     "yearly": {"days": 365, "stars": PRICE_YEARLY, "title": "Подписка 365 дней"},
 }
+MENU_ACTION_TEXTS = {
+    "📊 Статус",
+    "Статус",
+    "⚙️ Настройки",
+    "Настройки",
+    "📖 Инструкция",
+    "🔒 Приватность",
+    "💳 Купить подписку",
+    "👥 Пригласить друга",
+    "💬 Поддержка",
+    "◀️ Назад",
+}
 
 ALLOWED_UPDATES = [
     "message",
@@ -174,6 +186,17 @@ def save_support_link_from_result(result: dict, user_id: int):
     message_id = message.get("message_id")
     if message_id:
         db.save_support_message_link(message_id, user_id)
+
+
+def resolve_user_identifier(value: str):
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    username = value.lstrip("@").lower()
+    if not username:
+        return None
+    found = next((user for user in db.get_all_users() if (user.get("username") or "").lower() == username), None)
+    return found["user_id"] if found else None
 
 
 def get_ref_link(user_id: int) -> str:
@@ -340,10 +363,13 @@ def handle_update(update: dict):
 
         if text.startswith("/closesupport ") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=1)
-            if len(parts) < 2 or not parts[1].isdigit():
-                send(chat_id, "❌ Формат: /closesupport user_id")
+            if len(parts) < 2:
+                send(chat_id, "❌ Формат: /closesupport user_id или /closesupport @username")
                 return
-            target_id = int(parts[1])
+            target_id = resolve_user_identifier(parts[1])
+            if not target_id:
+                send(chat_id, "❌ Пользователь не найден. Используй user_id или @username.")
+                return
             target_settings = db.get_user_settings(target_id)
             db.save_user_settings(
                 target_id,
@@ -469,23 +495,26 @@ def handle_update(update: dict):
             return
 
         if s.get("support_active") and user_id != ADMIN_ID:
-            username = user.get("username")
-            first_name = user.get("first_name") or "Без имени"
-            media_type, media_file_id = get_support_media(msg)
-            message_body = text or msg.get("caption") or "[не текстовое сообщение]"
-            header = (
-                f"💬 <b>Сообщение в открытом диалоге поддержки</b>\n\n"
-                f"👤 Пользователь: {first_name}\n"
-                f"🆔 ID: <code>{user_id}</code>\n"
-                f"{'🔗 @' + username if username else '🔗 username не указан'}\n\n"
-                f"<b>Сообщение:</b>\n{message_body}"
-            )
-            header_result = send(ADMIN_ID, header)
-            save_support_link_from_result(header_result, user_id)
-            if media_type and media_file_id:
-                media_result = send_file(ADMIN_ID, media_file_id, media_type)
-                save_support_link_from_result(media_result, user_id)
-            return
+            if text.startswith("/") or text in MENU_ACTION_TEXTS:
+                pass
+            else:
+                username = user.get("username")
+                first_name = user.get("first_name") or "Без имени"
+                media_type, media_file_id = get_support_media(msg)
+                message_body = text or msg.get("caption") or "[не текстовое сообщение]"
+                header = (
+                    f"💬 <b>Сообщение в открытом диалоге поддержки</b>\n\n"
+                    f"👤 Пользователь: {first_name}\n"
+                    f"🆔 ID: <code>{user_id}</code>\n"
+                    f"{'🔗 @' + username if username else '🔗 username не указан'}\n\n"
+                    f"<b>Сообщение:</b>\n{message_body}"
+                )
+                header_result = send(ADMIN_ID, header)
+                save_support_link_from_result(header_result, user_id)
+                if media_type and media_file_id:
+                    media_result = send_file(ADMIN_ID, media_file_id, media_type)
+                    save_support_link_from_result(media_result, user_id)
+                return
 
         # Реферальная ссылка
         if text.startswith("/start ref_"):
