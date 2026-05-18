@@ -257,6 +257,28 @@ def handle_update(update: dict):
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
                           sender_link, "audio", msg["audio"]["file_id"], date_str)
 
+        # Фото
+        elif msg.get("photo"):
+            # Берём самое большое фото
+            file_id = msg["photo"][-1]["file_id"]
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
+                          sender_link, "photo", file_id, date_str)
+
+        # Видео
+        elif msg.get("video"):
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
+                          sender_link, "video", msg["video"]["file_id"], date_str)
+
+        # Документ/файл
+        elif msg.get("document"):
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
+                          sender_link, "document", msg["document"]["file_id"], date_str)
+
+        # Стикер
+        elif msg.get("sticker"):
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
+                          sender_link, "sticker", msg["sticker"]["file_id"], date_str)
+
     # ── Изменённое сообщение ───────────────────────────────
     elif "edited_business_message" in update:
         msg = update["edited_business_message"]
