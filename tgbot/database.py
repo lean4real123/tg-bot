@@ -65,6 +65,15 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            id              SERIAL PRIMARY KEY,
+            referrer_id     BIGINT,
+            referred_id     BIGINT UNIQUE,
+            created_at      TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -105,12 +114,28 @@ def get_all_users():
 
 
 def set_subscription(user_id: int, sub_type: str, days: int):
-    expires = datetime.now() + timedelta(days=days) if days > 0 else datetime.now()
+    if days > 0:
+        expires = datetime.now() + timedelta(days=days)
+    else:
+        expires = datetime.now()
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
         UPDATE users SET sub_type = %s, sub_expires = %s WHERE user_id = %s
     """, (sub_type, expires, user_id))
+    conn.commit()
+    conn.close()
+
+
+def add_days(user_id: int, days: int):
+    """Добавить дни к текущей подписке"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE users SET
+            sub_expires = GREATEST(COALESCE(sub_expires, NOW()), NOW()) + (%s || ' days')::INTERVAL
+        WHERE user_id = %s AND sub_type != 'banned'
+    """, (str(days), user_id))
     conn.commit()
     conn.close()
 
@@ -187,6 +212,37 @@ def get_recent_connections(limit: int = 10):
     rows = c.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ── Реферальная система ───────────────────────────────────
+
+def add_referral(referrer_id: int, referred_id: int) -> bool:
+    """Добавить реферала. Возвращает True если новый."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO referrals (referrer_id, referred_id)
+            VALUES (%s, %s)
+            ON CONFLICT(referred_id) DO NOTHING
+        """, (referrer_id, referred_id))
+        inserted = c.rowcount > 0
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def get_referral_count(user_id: int) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
 
 
 # ── Кэш текстовых сообщений ───────────────────────────────

@@ -1,4 +1,4 @@
-R"""
+"""
 Telegram Spy Bot — Business API
 """
 
@@ -18,16 +18,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Цены в Telegram Stars
+PRICE_MONTHLY = 150
+PRICE_YEARLY = 1200
+
 ALLOWED_UPDATES = [
     "message",
+    "callback_query",
     "business_connection",
     "business_message",
     "edited_business_message",
     "deleted_business_messages",
+    "pre_checkout_query",
 ]
 
-# Настройки пользователей в памяти: {user_id: {track_deleted, track_edited}}
 user_settings: dict = {}
+BOT_USERNAME = ""
 
 
 def get_settings(user_id: int) -> dict:
@@ -56,8 +62,18 @@ def send(chat_id, text, keyboard=None):
     api("sendMessage", **params)
 
 
+def send_invoice(chat_id: int, title: str, description: str, payload: str, amount: int):
+    api("sendInvoice",
+        chat_id=chat_id,
+        title=title,
+        description=description,
+        payload=payload,
+        currency="XTR",
+        prices=[{"label": title, "amount": amount}]
+    )
+
+
 def send_file(chat_id, file_id, file_type, caption=""):
-    """Пересылаем голосовое/кружочек/фото"""
     method_map = {
         "voice": "sendVoice",
         "video_note": "sendVideoNote",
@@ -65,13 +81,42 @@ def send_file(chat_id, file_id, file_type, caption=""):
         "photo": "sendPhoto",
         "video": "sendVideo",
         "document": "sendDocument",
+        "sticker": "sendSticker",
     }
     method = method_map.get(file_type, "sendDocument")
-    params = {"chat_id": chat_id, file_type: file_id}
-    if caption:
-        params["caption"] = caption
-        params["parse_mode"] = "HTML"
-    api(method, **params)
+    if file_type in ("video_note", "sticker"):
+        api(method, **{"chat_id": chat_id, file_type: file_id})
+        if caption:
+            send(chat_id, caption)
+    else:
+        params = {"chat_id": chat_id, file_type: file_id}
+        if caption:
+            params["caption"] = caption
+            params["parse_mode"] = "HTML"
+        api(method, **params)
+
+
+def get_ref_link(user_id: int) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+
+def send_expired_message(user_id: int):
+    ref_link = get_ref_link(user_id)
+    ref_count = db.get_referral_count(user_id)
+    send(user_id,
+        "⏰ <b>Ваша подписка истекла</b>\n\n"
+        "Для продолжения выберите вариант:\n\n"
+        f"👥 <b>Пригласи друга</b> — получи +3 дня бесплатно\n"
+        f"Приглашено: {ref_count} чел.\n\n"
+        "💳 <b>Или купи подписку за Telegram Stars:</b>",
+        keyboard={
+            "inline_keyboard": [
+                [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
+                [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
+                [{"text": "👥 Пригласить друга", "url": ref_link}],
+            ]
+        }
+    )
 
 
 def main_keyboard():
@@ -79,6 +124,7 @@ def main_keyboard():
         "keyboard": [
             [{"text": "📊 Статус"}, {"text": "⚙️ Настройки"}],
             [{"text": "📖 Инструкция"}, {"text": "🔒 Приватность"}],
+            [{"text": "💳 Купить подписку"}, {"text": "👥 Пригласить друга"}],
         ],
         "resize_keyboard": True
     }
@@ -105,13 +151,11 @@ def get_user_link(user: dict) -> str:
     if user.get("last_name"):
         name += " " + user["last_name"]
     name = name.strip() or "Неизвестный"
-    uid = user.get("id")
     username = user.get("username")
+    uid = user.get("id")
     if username:
-        # Если есть username — ссылка через @username (всегда работает)
         return f'<a href="https://t.me/{username}">{name} (@{username})</a>'
     elif uid:
-        # Если нет username — ссылка через tg://user?id=
         return f'<a href="tg://user?id={uid}">{name}</a>'
     return name
 
@@ -133,6 +177,19 @@ def get_chat_link(chat: dict) -> str:
 def handle_update(update: dict):
     logging.info(f"UPDATE: {list(update.keys())}")
 
+    # ── Успешная оплата ────────────────────────────────────
+    if "message" in update and update["message"].get("successful_payment"):
+        msg = update["message"]
+        user_id = msg["from"]["id"]
+        payload = msg["successful_payment"].get("invoice_payload", "")
+        if payload == "monthly":
+            db.set_subscription(user_id, "monthly", 30)
+            send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>30 дней</b> активирована.", keyboard=main_keyboard())
+        elif payload == "yearly":
+            db.set_subscription(user_id, "yearly", 365)
+            send(user_id, "✅ <b>Оплата прошла!</b>\nПодписка на <b>365 дней</b> активирована.", keyboard=main_keyboard())
+        return
+
     # ── Обычное сообщение боту ─────────────────────────────
     if "message" in update:
         msg = update["message"]
@@ -144,30 +201,48 @@ def handle_update(update: dict):
         db.save_user(user_id, user.get("username", ""), user.get("first_name", ""))
         s = get_settings(user_id)
 
-        if text == "/start":
+        # Реферальная ссылка
+        if text.startswith("/start ref_"):
+            referrer_str = text.replace("/start ref_", "").strip()
+            if referrer_str.isdigit():
+                referrer_id = int(referrer_str)
+                if referrer_id != user_id:
+                    is_new = db.add_referral(referrer_id, user_id)
+                    if is_new:
+                        db.add_days(referrer_id, 3)
+                        try:
+                            send(referrer_id, "🎉 <b>Друг зарегистрировался по вашей ссылке!</b>\n+3 дня добавлено к подписке.")
+                        except Exception:
+                            pass
+
+        if text.startswith("/start"):
             send(chat_id,
                 "👁 <b>Dialog Spy Bot</b>\n\n"
                 "Узнавай что скрывают — видь удалённые и изменённые сообщения в своих чатах.\n\n"
                 "🔍 <b>Что умеет бот:</b>\n"
-                "• Показывает удалённые сообщения, фото, видео, голосовые и кружочки\n"
-                "• Показывает что было написано до редактирования\n"
+                "• Удалённые сообщения, фото, видео, голосовые и кружочки\n"
+                "• Что было написано до редактирования\n"
                 "• Работает в реальном времени\n\n"
-                "🔒 <b>Безопасно:</b> бот видит только твои чаты — никто другой не имеет доступа к твоей переписке\n\n"
-                "Нажми <b>📖 Инструкция</b> чтобы подключить за 1 минуту.",
+                "🔒 Бот видит только твои чаты — никто другой не имеет доступа\n\n"
+                "🎁 <b>14 дней бесплатно</b> при первом подключении!\n\n"
+                "Нажми <b>📖 Инструкция</b> чтобы подключить.",
                 keyboard=main_keyboard()
             )
 
         elif text in ("📊 Статус", "Статус"):
-            is_connected = db.get_connections_count_for_user(user_id)
-            # Также проверяем через chat_id (они могут отличаться)
-            if not is_connected:
-                is_connected = db.get_connections_count_for_user(msg["chat"]["id"])
+            is_connected = db.get_connections_count_for_user(user_id) or db.get_connections_count_for_user(chat_id)
             status = "🟢 Подключён" if is_connected else "🔴 Не подключён"
+            sub_active = db.is_sub_active(user_id)
+            user_data = db.get_user(user_id)
+            sub_type = user_data.get("sub_type", "trial") if user_data else "trial"
+            sub_expires = str(user_data.get("sub_expires", ""))[:10] if user_data else "—"
             del_icon = "✅" if s["track_deleted"] else "❌"
             edit_icon = "✅" if s["track_edited"] else "❌"
             send(chat_id,
                 f"📊 <b>Статус</b>\n\n"
                 f"Подключение: {status}\n"
+                f"Подписка: {'✅ Активна' if sub_active else '❌ Истекла'} ({sub_type})\n"
+                f"До: {sub_expires}\n"
                 f"Удалённые: {del_icon}\n"
                 f"Изменённые: {edit_icon}\n\n"
                 + ("" if is_connected else "Добавь бота в <b>Автоматизация чатов</b>"),
@@ -175,100 +250,97 @@ def handle_update(update: dict):
             )
 
         elif text in ("⚙️ Настройки", "Настройки"):
-            send(chat_id,
-                "⚙️ <b>Настройки</b>\n\nВыбери что отслеживать:",
-                keyboard=settings_keyboard(user_id)
-            )
+            send(chat_id, "⚙️ <b>Настройки</b>\n\nВыбери что отслеживать:", keyboard=settings_keyboard(user_id))
 
         elif "Удалённые сообщения" in text:
             s["track_deleted"] = not s["track_deleted"]
-            icon = "✅" if s["track_deleted"] else "❌"
-            send(chat_id,
-                f"Удалённые сообщения: {icon}",
-                keyboard=settings_keyboard(user_id)
-            )
+            send(chat_id, f"Удалённые сообщения: {'✅' if s['track_deleted'] else '❌'}", keyboard=settings_keyboard(user_id))
 
         elif "Изменённые сообщения" in text:
             s["track_edited"] = not s["track_edited"]
-            icon = "✅" if s["track_edited"] else "❌"
-            send(chat_id,
-                f"Изменённые сообщения: {icon}",
-                keyboard=settings_keyboard(user_id)
-            )
+            send(chat_id, f"Изменённые сообщения: {'✅' if s['track_edited'] else '❌'}", keyboard=settings_keyboard(user_id))
 
         elif text == "◀️ Назад":
             send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
-        elif text in ("🔒 Приватность", "Приватность"):
+        elif text in ("💳 Купить подписку",):
+            send(chat_id,
+                f"💳 <b>Купить подписку</b>\n\n"
+                f"⭐ 30 дней — {PRICE_MONTHLY} Telegram Stars\n"
+                f"⭐ 365 дней — {PRICE_YEARLY} Telegram Stars\n\n"
+                "Оплата через Telegram Stars — мгновенно и безопасно.",
+                keyboard={
+                    "inline_keyboard": [
+                        [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
+                        [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
+                    ]
+                }
+            )
+
+        elif text in ("👥 Пригласить друга",):
+            ref_link = get_ref_link(user_id)
+            ref_count = db.get_referral_count(user_id)
+            share_url = f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этого%20бота!"
+            send(chat_id,
+                f"👥 <b>Пригласи друга — получи +3 дня</b>\n\n"
+                f"За каждого друга который зарегистрируется по твоей ссылке — "
+                f"ты получаешь <b>+3 дня</b> автоматически.\n\n"
+                f"Твоя ссылка:\n<code>{ref_link}</code>\n\n"
+                f"Приглашено друзей: <b>{ref_count}</b>",
+                keyboard={"inline_keyboard": [[{"text": "📤 Поделиться", "url": share_url}]]}
+            )
+
+        elif text in ("🔒 Приватность",):
             send(chat_id,
                 "🔒 <b>Приватность и безопасность</b>\n\n"
-                "Мы понимаем что вопрос доверия важен. Вот как всё устроено:\n\n"
-                "✅ <b>Только твои данные</b>\n"
-                "Бот видит исключительно твои личные чаты — те, в которых ты сам участвуешь. "
-                "Никакой другой пользователь не имеет доступа к твоей переписке.\n\n"
-                "✅ <b>Уведомления только тебе</b>\n"
-                "Все уведомления об удалённых и изменённых сообщениях приходят только тебе в этот чат.\n\n"
-                "✅ <b>Официальный API Telegram</b>\n"
-                "Бот работает через официальную функцию Telegram «Автоматизация чатов» — "
-                "это стандартный инструмент для бизнес-аккаунтов.\n\n"
-                "✅ <b>Ты контролируешь доступ</b>\n"
-                "В любой момент можешь отключить бота: "
-                "Профиль → Изм. → Автоматизация чатов → удали бота.\n\n"
-                "❓ Есть вопросы? Напиши нам.",
+                "✅ Бот видит только твои чаты\n"
+                "✅ Уведомления приходят только тебе\n"
+                "✅ Работает через официальный API Telegram\n"
+                "✅ Отключить можно в любой момент:\n"
+                "Профиль → Изм. → Автоматизация чатов → удали бота",
                 keyboard=main_keyboard()
             )
 
-        elif text in ("📖 Инструкция", "Инструкция"):
+        elif text in ("📖 Инструкция",):
             send(chat_id,
-                "⚙️ <b>Как подключить бота:</b>\n\n"
-                "<b>Способ 1 — Новая версия Telegram (рекомендуется):</b>\n"
-                "1️⃣ Открой свой профиль\n"
-                "2️⃣ Нажми <b>Изм.</b> (карандаш)\n"
-                "3️⃣ Прокрути вниз → <b>Автоматизация чатов</b>\n"
-                "4️⃣ Введи <code>@DialogDelete123Bot</code> → <b>Добавить</b>\n\n"
-                "<b>Способ 2 — Telegram Premium (старая версия):</b>\n"
-                "1️⃣ Настройки Telegram\n"
-                "2️⃣ <b>Telegram для бизнеса</b>\n"
-                "3️⃣ <b>Чат-боты</b>\n"
-                "4️⃣ Введи <code>@DialogDelete123Bot</code> → <b>Добавить</b>\n\n"
-                "✅ После подключения уведомления будут приходить сюда.\n\n"
-                "⚠️ <i>Если раздел не появляется — обнови Telegram до последней версии</i>",
+                "⚙️ <b>Как подключить:</b>\n\n"
+                "<b>Способ 1 — Новая версия Telegram:</b>\n"
+                "1️⃣ Открой профиль → <b>Изм.</b>\n"
+                "2️⃣ Прокрути вниз → <b>Автоматизация чатов</b>\n"
+                f"3️⃣ Введи <code>@{BOT_USERNAME}</code> → <b>Добавить</b>\n\n"
+                "<b>Способ 2 — Telegram Premium:</b>\n"
+                "1️⃣ Настройки → <b>Telegram для бизнеса</b>\n"
+                "2️⃣ <b>Чат-боты</b>\n"
+                f"3️⃣ Введи <code>@{BOT_USERNAME}</code> → <b>Добавить</b>\n\n"
+                "⚠️ <i>Если раздел не появляется — обнови Telegram</i>",
                 keyboard=main_keyboard()
             )
 
         elif text == "/admin" and user_id == ADMIN_ID:
             users = db.get_all_users()
             connections = db.get_connections_count()
-            active = sum(1 for u in users if db.is_sub_active(u["user_id"]))
             trial = sum(1 for u in users if u["sub_type"] == "trial")
             paid = sum(1 for u in users if u["sub_type"] in ("monthly", "yearly"))
             banned = sum(1 for u in users if u["sub_type"] == "banned")
-
-            # Последние 5 подключений
             recent = db.get_recent_connections(5)
             recent_text = ""
             for r in recent:
                 name = r.get("first_name") or r.get("username") or str(r["owner_id"])
                 uname = f"@{r['username']}" if r.get("username") else f"id:{r['owner_id']}"
-                status = "🟢" if r["is_enabled"] else "🔴"
+                icon = "🟢" if r["is_enabled"] else "🔴"
                 sub = r.get("sub_type", "?")
-                date = (r.get("connected_at") or "")[:16]
-                recent_text += f"\n{status} {name} ({uname}) · {sub} · {date}"
-
+                date = str(r.get("connected_at") or "")[:16]
+                recent_text += f"\n{icon} {name} ({uname}) · {sub} · {date}"
             send(chat_id,
                 f"👑 <b>Админ панель</b>\n\n"
-                f"👥 Всего пользователей: {len(users)}\n"
-                f"🔗 Активных подключений: {connections}\n\n"
-                f"📊 <b>Подписки:</b>\n"
-                f"🆓 Trial: {trial}\n"
-                f"💳 Платных: {paid}\n"
-                f"🚫 Забанено: {banned}\n\n"
-                f"🕐 <b>Последние подключения:</b>"
-                f"{recent_text or ' нет данных'}\n\n"
+                f"👥 Пользователей: {len(users)}\n"
+                f"🔗 Подключений: {connections}\n\n"
+                f"🆓 Trial: {trial} | 💳 Платных: {paid} | 🚫 Бан: {banned}\n\n"
+                f"🕐 <b>Последние подключения:</b>{recent_text or ' нет'}\n\n"
                 f"<b>Команды:</b>\n"
-                f"/sub [id] [monthly/yearly/trial] — выдать подписку\n"
-                f"/ban [id] — забанить\n"
-                f"/users — список всех пользователей"
+                f"/sub @user monthly|yearly|trial\n"
+                f"/ban @user | /unban @user\n"
+                f"/users"
             )
 
         elif text.startswith("/sub ") and user_id == ADMIN_ID:
@@ -281,18 +353,15 @@ def handle_update(update: dict):
                     if target.isdigit():
                         target_id = int(target)
                     else:
-                        all_users = db.get_all_users()
-                        found = next((u for u in all_users if (u.get("username") or "").lower() == target.lower()), None)
+                        found = next((u for u in db.get_all_users() if (u.get("username") or "").lower() == target.lower()), None)
                         if not found:
-                            send(chat_id, f"❌ Пользователь @{target} не найден.")
+                            send(chat_id, f"❌ @{target} не найден.")
                             return
                         target_id = found["user_id"]
                     db.set_subscription(target_id, sub_type, days)
-                    send(chat_id, f"✅ Подписка <b>{sub_type}</b> выдана {target_id} на {days} дней.")
+                    send(chat_id, f"✅ {sub_type} выдан {target_id} на {days} дней.")
                 except Exception as e:
-                    send(chat_id, f"❌ Ошибка: {e}\nФормат: /sub [id или @username] [monthly/yearly/trial]")
-            else:
-                send(chat_id, "Формат: /sub [id или @username] [monthly/yearly/trial]")
+                    send(chat_id, f"❌ {e}")
 
         elif text.startswith("/ban ") and user_id == ADMIN_ID:
             parts = text.split()
@@ -302,21 +371,19 @@ def handle_update(update: dict):
                     if target.isdigit():
                         target_id = int(target)
                     else:
-                        all_users = db.get_all_users()
-                        found = next((u for u in all_users if (u.get("username") or "").lower() == target.lower()), None)
+                        found = next((u for u in db.get_all_users() if (u.get("username") or "").lower() == target.lower()), None)
                         if not found:
-                            send(chat_id, f"❌ Пользователь @{target} не найден.")
+                            send(chat_id, f"❌ @{target} не найден.")
                             return
                         target_id = found["user_id"]
                     db.set_subscription(target_id, "banned", 0)
-                    send(chat_id, f"🚫 Пользователь {target_id} забанен.")
-                    # Уведомляем забаненного
+                    send(chat_id, f"🚫 {target_id} забанен.")
                     try:
-                        send(target_id, "🚫 Ваш доступ к боту заблокирован.")
-                    except:
+                        send(target_id, "🚫 Ваш доступ заблокирован.")
+                    except Exception:
                         pass
                 except Exception as e:
-                    send(chat_id, f"❌ Ошибка: {e}")
+                    send(chat_id, f"❌ {e}")
 
         elif text.startswith("/unban ") and user_id == ADMIN_ID:
             parts = text.split()
@@ -326,129 +393,107 @@ def handle_update(update: dict):
                     if target.isdigit():
                         target_id = int(target)
                     else:
-                        all_users = db.get_all_users()
-                        found = next((u for u in all_users if (u.get("username") or "").lower() == target.lower()), None)
+                        found = next((u for u in db.get_all_users() if (u.get("username") or "").lower() == target.lower()), None)
                         if not found:
-                            send(chat_id, f"❌ Пользователь @{target} не найден.")
+                            send(chat_id, f"❌ @{target} не найден.")
                             return
                         target_id = found["user_id"]
                     db.set_subscription(target_id, "trial", 14)
-                    send(chat_id, f"✅ Пользователь {target_id} разбанен, выдан trial на 14 дней.")
+                    send(chat_id, f"✅ {target_id} разбанен, trial 14 дней.")
                     try:
-                        send(target_id, "✅ Ваш доступ к боту восстановлен.")
-                    except:
+                        send(target_id, "✅ Ваш доступ восстановлен.")
+                    except Exception:
                         pass
                 except Exception as e:
-                    send(chat_id, f"❌ Ошибка: {e}")
+                    send(chat_id, f"❌ {e}")
 
         elif text == "/users" and user_id == ADMIN_ID:
             users = db.get_all_users()
             if not users:
                 send(chat_id, "Нет пользователей.")
                 return
-            text_out = "👥 <b>Все пользователи:</b>\n\n"
+            text_out = "👥 <b>Пользователи:</b>\n\n"
             for u in users[:20]:
-                name = u.get("first_name") or u.get("username") or str(u["user_id"])
                 uid = u["user_id"]
+                name = u.get("first_name") or u.get("username") or str(uid)
                 if u.get("username"):
-                    uname_link = f'<a href="https://t.me/{u["username"]}">@{u["username"]}</a>'
+                    link = f'<a href="https://t.me/{u["username"]}">@{u["username"]}</a>'
                 else:
-                    uname_link = f'<a href="tg://user?id={uid}">{name}</a>'
+                    link = f'<a href="tg://user?id={uid}">{name}</a>'
                 sub = u.get("sub_type", "?")
-                expires = (u.get("sub_expires") or "")[:10]
-                active_icon = "✅" if db.is_sub_active(uid) else "❌"
-                connected = "🔗" if db.get_connections_count_for_user(uid) else "  "
-                text_out += f"{active_icon}{connected} {uname_link} (id:{uid})\n    {sub} до {expires}\n\n"
+                exp = str(u.get("sub_expires") or "")[:10]
+                icon = "✅" if db.is_sub_active(uid) else "❌"
+                conn_icon = "🔗" if db.get_connections_count_for_user(uid) else "  "
+                text_out += f"{icon}{conn_icon} {link} (id:{uid})\n    {sub} до {exp}\n\n"
             send(chat_id, text_out)
+
+    # ── Callback кнопки ────────────────────────────────────
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        user_id = cq["from"]["id"]
+        data = cq.get("data", "")
+        api("answerCallbackQuery", callback_query_id=cq["id"])
+
+        if data == "buy_monthly":
+            send_invoice(user_id, "Подписка 30 дней", "Dialog Spy Bot — 30 дней доступа", "monthly", PRICE_MONTHLY)
+        elif data == "buy_yearly":
+            send_invoice(user_id, "Подписка 365 дней", "Dialog Spy Bot — 365 дней доступа", "yearly", PRICE_YEARLY)
+
+    # ── Pre-checkout ───────────────────────────────────────
+    elif "pre_checkout_query" in update:
+        pcq = update["pre_checkout_query"]
+        api("answerPreCheckoutQuery", pre_checkout_query_id=pcq["id"], ok=True)
 
     # ── Подключение бизнес-аккаунта ───────────────────────
     elif "business_connection" in update:
         bc = update["business_connection"]
-        logging.info(f"[BUSINESS_CONNECTION] {bc}")
         owner_id = bc["user_chat_id"]
         is_enabled = bc.get("is_enabled", False)
         db.save_connection(bc["id"], owner_id, is_enabled)
-
         if is_enabled:
-            send(owner_id,
-                "✅ <b>Бот подключён!</b>\n\nБуду присылать уведомления об удалённых и изменённых сообщениях.",
-                keyboard=main_keyboard()
-            )
+            send(owner_id, "✅ <b>Бот подключён!</b>\n\nБуду присылать уведомления об удалённых и изменённых сообщениях.", keyboard=main_keyboard())
         else:
             send(owner_id, "❌ Бот отключён.", keyboard=main_keyboard())
 
-    # ── Новое сообщение из бизнес-чата — кэшируем ─────────
+    # ── Новое сообщение из бизнес-чата ────────────────────
     elif "business_message" in update:
         msg = update["business_message"]
         conn_id = msg.get("business_connection_id", "")
         sender = msg.get("from", {})
         owner_id = db.get_owner_by_connection(conn_id) or ADMIN_ID
 
-        # Кэшируем только входящие сообщения (от собеседника, не от владельца)
-        # chat.id == собеседник, sender.id == кто написал
-        # Если отправитель — сам владелец, пропускаем
-        if sender.get("id") == owner_id:
-            return
-
-        # Также пропускаем если чат — это сам владелец (исходящие)
-        if msg["chat"]["id"] == owner_id:
+        if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
 
         date_str = datetime.fromtimestamp(msg["date"]).strftime("%d.%m.%Y %H:%M")
         sender_link = get_user_link(sender)
 
-        # Текст
         if msg.get("text"):
-            db.cache_message(conn_id, msg["chat"]["id"], msg["message_id"],
-                             sender_link, msg["text"], date_str)
-
-        # Голосовое
+            db.cache_message(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, msg["text"], date_str)
         elif msg.get("voice"):
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "voice", msg["voice"]["file_id"], date_str)
-
-        # Кружочек
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "voice", msg["voice"]["file_id"], date_str)
         elif msg.get("video_note"):
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "video_note", msg["video_note"]["file_id"], date_str)
-
-        # Аудио
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "video_note", msg["video_note"]["file_id"], date_str)
         elif msg.get("audio"):
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "audio", msg["audio"]["file_id"], date_str)
-
-        # Фото
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "audio", msg["audio"]["file_id"], date_str)
         elif msg.get("photo"):
-            # Берём самое большое фото
-            file_id = msg["photo"][-1]["file_id"]
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "photo", file_id, date_str)
-
-        # Видео
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "photo", msg["photo"][-1]["file_id"], date_str)
         elif msg.get("video"):
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "video", msg["video"]["file_id"], date_str)
-
-        # Документ/файл
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "video", msg["video"]["file_id"], date_str)
         elif msg.get("document"):
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "document", msg["document"]["file_id"], date_str)
-
-        # Стикер
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "document", msg["document"]["file_id"], date_str)
         elif msg.get("sticker"):
-            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"],
-                          sender_link, "sticker", msg["sticker"]["file_id"], date_str)
+            db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "sticker", msg["sticker"]["file_id"], date_str)
 
     # ── Изменённое сообщение ───────────────────────────────
     elif "edited_business_message" in update:
         msg = update["edited_business_message"]
         conn_id = msg.get("business_connection_id", "")
         new_text = msg.get("text", "")
-
         owner_id = db.get_owner_by_connection(conn_id) or ADMIN_ID
 
-        # Проверяем подписку
         if not db.is_sub_active(owner_id):
+            send_expired_message(owner_id)
             return
 
         s = get_settings(owner_id)
@@ -457,10 +502,9 @@ def handle_update(update: dict):
 
         original = db.get_cached_message(conn_id, msg["chat"]["id"], msg["message_id"])
         if original and original["text"] != new_text:
-            chat_link = get_chat_link(msg["chat"])
             send(owner_id,
                 f"✏️ <b>Сообщение изменено</b>\n"
-                f"👤 {chat_link}\n"
+                f"👤 {get_chat_link(msg['chat'])}\n"
                 f"🕐 {original['date']}\n\n"
                 f"<b>Было:</b>\n{original['text']}\n\n"
                 f"<b>Стало:</b>\n{new_text}"
@@ -473,8 +517,8 @@ def handle_update(update: dict):
         conn_id = event.get("business_connection_id", "")
         owner_id = db.get_owner_by_connection(conn_id) or ADMIN_ID
 
-        # Проверяем подписку
         if not db.is_sub_active(owner_id):
+            send_expired_message(owner_id)
             return
 
         s = get_settings(owner_id)
@@ -484,7 +528,6 @@ def handle_update(update: dict):
         chat_link = get_chat_link(event["chat"])
 
         for msg_id in event["message_ids"]:
-            # Проверяем текстовый кэш
             original = db.get_cached_message(conn_id, event["chat"]["id"], msg_id)
             if original:
                 send(owner_id,
@@ -496,29 +539,28 @@ def handle_update(update: dict):
                 db.delete_cached_message(conn_id, event["chat"]["id"], msg_id)
                 continue
 
-            # Проверяем медиа кэш
             media = db.get_cached_media(conn_id, event["chat"]["id"], msg_id)
             if media:
-                caption = (
-                    f"🗑️ <b>Удалено</b> · {media['file_type']}\n"
-                    f"👤 {chat_link}\n"
-                    f"🕐 {media['date']}"
-                )
+                caption = f"🗑️ <b>Удалено</b> · {media['file_type']}\n👤 {chat_link}\n🕐 {media['date']}"
                 send_file(owner_id, media["file_id"], media["file_type"], caption)
                 db.delete_cached_media(conn_id, event["chat"]["id"], msg_id)
 
 
 def main():
+    global BOT_USERNAME
     db.init_db()
+
+    me = api("getMe")
+    BOT_USERNAME = me.get("result", {}).get("username", "DialogDelBot")
+
     print("=" * 40)
-    print("Бот запущен!")
+    print(f"Бот @{BOT_USERNAME} запущен!")
     print("=" * 40)
 
     offset = 0
     while True:
         try:
-            result = api("getUpdates", offset=offset, timeout=0,
-                         allowed_updates=ALLOWED_UPDATES)
+            result = api("getUpdates", offset=offset, timeout=0, allowed_updates=ALLOWED_UPDATES)
             if not result.get("ok"):
                 time.sleep(5)
                 continue
