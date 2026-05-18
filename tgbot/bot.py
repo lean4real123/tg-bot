@@ -302,7 +302,9 @@ def handle_update(update: dict):
         if text == "/cancel":
             if s.get("support_mode"):
                 s["support_mode"] = False
-                db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
+                db.save_user_settings(
+                    user_id, s["track_deleted"], s["track_edited"], s["support_mode"], s.get("support_active", False)
+                )
                 send(chat_id, "✅ Режим обращения в поддержку выключен.", keyboard=main_keyboard())
             else:
                 send(chat_id, "ℹ️ Сейчас режим поддержки не активен.", keyboard=main_keyboard())
@@ -335,6 +337,70 @@ def handle_update(update: dict):
                     return
                 send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
                 return
+
+        if text.startswith("/closesupport ") and user_id == ADMIN_ID:
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].isdigit():
+                send(chat_id, "❌ Формат: /closesupport user_id")
+                return
+            target_id = int(parts[1])
+            target_settings = db.get_user_settings(target_id)
+            db.save_user_settings(
+                target_id,
+                target_settings.get("track_deleted", True),
+                target_settings.get("track_edited", True),
+                False,
+                False,
+            )
+            send(chat_id, f"✅ Диалог поддержки с пользователем {target_id} закрыт.")
+            send(target_id, "✅ <b>Диалог с поддержкой закрыт.</b>\nЕсли понадобится, нажми «💬 Поддержка» снова.")
+            return
+
+        if text == "/supportlist" and user_id == ADMIN_ID:
+            active_support = db.get_users_with_active_support()
+            if not active_support:
+                send(chat_id, "ℹ️ Сейчас нет активных диалогов поддержки.")
+                return
+            out = "💬 <b>Активные диалоги поддержки</b>\n\n"
+            for item in active_support:
+                support_user_id = item.get("user_id")
+                first_name = item.get("first_name") or "Без имени"
+                username = f"@{item['username']}" if item.get("username") else "без username"
+                updated_at = item.get("updated_at")
+                updated_text = updated_at.strftime("%d.%m.%Y %H:%M") if updated_at else "—"
+                out += (
+                    f"• {first_name} ({username})\n"
+                    f"ID: <code>{support_user_id}</code>\n"
+                    f"Последняя активность: {updated_text}\n"
+                    f"Закрыть: <code>/closesupport {support_user_id}</code>\n\n"
+                )
+            send(chat_id, out)
+            return
+
+        if text.startswith("/payments ") and user_id == ADMIN_ID:
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].isdigit():
+                send(chat_id, "❌ Формат: /payments user_id")
+                return
+            target_id = int(parts[1])
+            payments = db.get_payments_by_user(target_id, limit=10)
+            if not payments:
+                send(chat_id, f"ℹ️ У пользователя {target_id} нет сохранённых платежей.")
+                return
+            out = f"💳 <b>Платежи пользователя {target_id}</b>\n\n"
+            for payment in payments:
+                created_at = payment.get("created_at")
+                created_text = created_at.strftime("%d.%m.%Y %H:%M") if created_at else "—"
+                refunded = "да" if payment.get("refunded") else "нет"
+                out += (
+                    f"• Тариф: {payment.get('invoice_payload')}\n"
+                    f"Сумма: {payment.get('total_amount')} {payment.get('currency')}\n"
+                    f"Возврат: {refunded}\n"
+                    f"Дата: {created_text}\n"
+                    f"Charge ID:\n<code>{payment.get('telegram_payment_charge_id')}</code>\n\n"
+                )
+            send(chat_id, out)
+            return
 
         if text.startswith("/refund ") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=2)
@@ -392,13 +458,33 @@ def handle_update(update: dict):
                 media_result = send_file(ADMIN_ID, media_file_id, media_type)
                 save_support_link_from_result(media_result, user_id)
             s["support_mode"] = False
-            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
+            s["support_active"] = True
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"], s["support_active"])
             send(
                 chat_id,
                 "✅ Сообщение отправлено в поддержку. Ответ придёт сюда.\n\n"
-                "Если нужно написать ещё раз, снова нажми кнопку «💬 Поддержка».",
+                "Диалог с поддержкой открыт. Можешь продолжать писать сюда, и сообщения будут пересылаться админу.",
                 keyboard=main_keyboard(),
             )
+            return
+
+        if s.get("support_active") and user_id != ADMIN_ID:
+            username = user.get("username")
+            first_name = user.get("first_name") or "Без имени"
+            media_type, media_file_id = get_support_media(msg)
+            message_body = text or msg.get("caption") or "[не текстовое сообщение]"
+            header = (
+                f"💬 <b>Сообщение в открытом диалоге поддержки</b>\n\n"
+                f"👤 Пользователь: {first_name}\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"{'🔗 @' + username if username else '🔗 username не указан'}\n\n"
+                f"<b>Сообщение:</b>\n{message_body}"
+            )
+            header_result = send(ADMIN_ID, header)
+            save_support_link_from_result(header_result, user_id)
+            if media_type and media_file_id:
+                media_result = send_file(ADMIN_ID, media_file_id, media_type)
+                save_support_link_from_result(media_result, user_id)
             return
 
         # Реферальная ссылка
@@ -454,12 +540,24 @@ def handle_update(update: dict):
 
         elif "Удалённые сообщения" in text:
             s["track_deleted"] = not s["track_deleted"]
-            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s.get("support_mode", False))
+            db.save_user_settings(
+                user_id,
+                s["track_deleted"],
+                s["track_edited"],
+                s.get("support_mode", False),
+                s.get("support_active", False),
+            )
             send(chat_id, f"Удалённые сообщения: {'✅' if s['track_deleted'] else '❌'}", keyboard=settings_keyboard(user_id))
 
         elif "Изменённые сообщения" in text:
             s["track_edited"] = not s["track_edited"]
-            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s.get("support_mode", False))
+            db.save_user_settings(
+                user_id,
+                s["track_deleted"],
+                s["track_edited"],
+                s.get("support_mode", False),
+                s.get("support_active", False),
+            )
             send(chat_id, f"Изменённые сообщения: {'✅' if s['track_edited'] else '❌'}", keyboard=settings_keyboard(user_id))
 
         elif text == "◀️ Назад":
@@ -496,7 +594,8 @@ def handle_update(update: dict):
 
         elif text in ("💬 Поддержка",):
             s["support_mode"] = True
-            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
+            s["support_active"] = False
+            db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"], s["support_active"])
             send(
                 chat_id,
                 "💬 <b>Поддержка</b>\n\n"
@@ -562,6 +661,9 @@ def handle_update(update: dict):
                 f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
                 f"/refund user_id telegram_payment_charge_id — вернуть Stars\n"
                 f"/cancelsub user_id — отключить подписку без возврата\n"
+                f"/closesupport user_id — закрыть диалог поддержки\n"
+                f"/supportlist — активные диалоги поддержки\n"
+                f"/payments user_id — последние платежи пользователя\n"
                 f"/admin"
             )
 

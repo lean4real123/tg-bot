@@ -84,6 +84,7 @@ def init_db():
             track_deleted   BOOLEAN DEFAULT TRUE,
             track_edited    BOOLEAN DEFAULT TRUE,
             support_mode    BOOLEAN DEFAULT FALSE,
+            support_active  BOOLEAN DEFAULT FALSE,
             updated_at      TIMESTAMP DEFAULT NOW()
         )
     """)
@@ -91,6 +92,11 @@ def init_db():
     c.execute("""
         ALTER TABLE user_settings
         ADD COLUMN IF NOT EXISTS support_mode BOOLEAN DEFAULT FALSE
+    """)
+
+    c.execute("""
+        ALTER TABLE user_settings
+        ADD COLUMN IF NOT EXISTS support_active BOOLEAN DEFAULT FALSE
     """)
 
     c.execute("""
@@ -155,6 +161,21 @@ def get_all_users():
     return [dict(r) for r in rows]
 
 
+def get_users_with_active_support():
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c.execute("""
+        SELECT u.user_id, u.username, u.first_name, us.updated_at
+        FROM user_settings us
+        LEFT JOIN users u ON u.user_id = us.user_id
+        WHERE us.support_active = TRUE
+        ORDER BY us.updated_at DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def set_subscription(user_id: int, sub_type: str, days: int):
     if days > 0:
         expires = now_msk() + timedelta(days=days)
@@ -209,27 +230,42 @@ def get_user_settings(user_id: int):
     """, (user_id,))
     c.execute("""
         SELECT track_deleted, track_edited, support_mode
+             , support_active
         FROM user_settings
         WHERE user_id = %s
     """, (user_id,))
     row = c.fetchone()
     conn.commit()
     conn.close()
-    return dict(row) if row else {"track_deleted": True, "track_edited": True, "support_mode": False}
+    return dict(row) if row else {
+        "track_deleted": True,
+        "track_edited": True,
+        "support_mode": False,
+        "support_active": False,
+    }
 
 
-def save_user_settings(user_id: int, track_deleted: bool, track_edited: bool, support_mode: bool = False):
+def save_user_settings(
+    user_id: int,
+    track_deleted: bool,
+    track_edited: bool,
+    support_mode: bool = False,
+    support_active: bool = False,
+):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO user_settings (user_id, track_deleted, track_edited, support_mode, updated_at)
-        VALUES (%s, %s, %s, %s, NOW())
+        INSERT INTO user_settings (
+            user_id, track_deleted, track_edited, support_mode, support_active, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, NOW())
         ON CONFLICT (user_id) DO UPDATE SET
             track_deleted = EXCLUDED.track_deleted,
             track_edited = EXCLUDED.track_edited,
             support_mode = EXCLUDED.support_mode,
+            support_active = EXCLUDED.support_active,
             updated_at = NOW()
-    """, (user_id, track_deleted, track_edited, support_mode))
+    """, (user_id, track_deleted, track_edited, support_mode, support_active))
     conn.commit()
     conn.close()
 
@@ -278,6 +314,21 @@ def get_payment(telegram_payment_charge_id: str):
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def get_payments_by_user(user_id: int, limit: int = 10):
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c.execute("""
+        SELECT *
+        FROM payments
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def mark_payment_refunded(telegram_payment_charge_id: str):
