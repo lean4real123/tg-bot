@@ -159,6 +159,9 @@ def handle_update(update: dict):
 
         elif text in ("📊 Статус", "Статус"):
             is_connected = db.get_connections_count_for_user(user_id)
+            # Также проверяем через chat_id (они могут отличаться)
+            if not is_connected:
+                is_connected = db.get_connections_count_for_user(msg["chat"]["id"])
             status = "🟢 Подключён" if is_connected else "🔴 Не подключён"
             del_icon = "✅" if s["track_deleted"] else "❌"
             edit_icon = "✅" if s["track_edited"] else "❌"
