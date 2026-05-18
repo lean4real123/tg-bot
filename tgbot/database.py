@@ -93,6 +93,29 @@ def init_db():
         ADD COLUMN IF NOT EXISTS support_mode BOOLEAN DEFAULT FALSE
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id                          SERIAL PRIMARY KEY,
+            user_id                     BIGINT NOT NULL,
+            invoice_payload             TEXT NOT NULL,
+            total_amount                BIGINT NOT NULL,
+            currency                    TEXT NOT NULL,
+            telegram_payment_charge_id  TEXT UNIQUE NOT NULL,
+            provider_payment_charge_id  TEXT,
+            refunded                    BOOLEAN DEFAULT FALSE,
+            created_at                  TIMESTAMP DEFAULT NOW(),
+            refunded_at                 TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS support_message_links (
+            admin_message_id    BIGINT PRIMARY KEY,
+            user_id             BIGINT NOT NULL,
+            created_at          TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -209,6 +232,90 @@ def save_user_settings(user_id: int, track_deleted: bool, track_edited: bool, su
     """, (user_id, track_deleted, track_edited, support_mode))
     conn.commit()
     conn.close()
+
+
+def save_payment(
+    user_id: int,
+    invoice_payload: str,
+    total_amount: int,
+    currency: str,
+    telegram_payment_charge_id: str,
+    provider_payment_charge_id: str = "",
+):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO payments (
+            user_id, invoice_payload, total_amount, currency,
+            telegram_payment_charge_id, provider_payment_charge_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (telegram_payment_charge_id) DO UPDATE SET
+            user_id = EXCLUDED.user_id,
+            invoice_payload = EXCLUDED.invoice_payload,
+            total_amount = EXCLUDED.total_amount,
+            currency = EXCLUDED.currency,
+            provider_payment_charge_id = EXCLUDED.provider_payment_charge_id
+    """, (
+        user_id,
+        invoice_payload,
+        total_amount,
+        currency,
+        telegram_payment_charge_id,
+        provider_payment_charge_id or "",
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_payment(telegram_payment_charge_id: str):
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c.execute("""
+        SELECT * FROM payments
+        WHERE telegram_payment_charge_id = %s
+    """, (telegram_payment_charge_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def mark_payment_refunded(telegram_payment_charge_id: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE payments
+        SET refunded = TRUE, refunded_at = NOW()
+        WHERE telegram_payment_charge_id = %s
+    """, (telegram_payment_charge_id,))
+    conn.commit()
+    conn.close()
+
+
+def save_support_message_link(admin_message_id: int, user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO support_message_links (admin_message_id, user_id)
+        VALUES (%s, %s)
+        ON CONFLICT (admin_message_id) DO UPDATE SET
+            user_id = EXCLUDED.user_id
+    """, (admin_message_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_support_message_link(admin_message_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT user_id
+        FROM support_message_links
+        WHERE admin_message_id = %s
+    """, (admin_message_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 # ── Бизнес-подключения ────────────────────────────────────

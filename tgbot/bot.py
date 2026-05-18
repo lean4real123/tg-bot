@@ -167,6 +167,15 @@ def get_support_media(msg: dict):
     return None, None
 
 
+def save_support_link_from_result(result: dict, user_id: int):
+    if not result or not result.get("ok"):
+        return
+    message = result.get("result", {})
+    message_id = message.get("message_id")
+    if message_id:
+        db.save_support_message_link(message_id, user_id)
+
+
 def get_ref_link(user_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
@@ -254,12 +263,23 @@ def handle_update(update: dict):
     if "message" in update and update["message"].get("successful_payment"):
         msg = update["message"]
         user_id = msg["from"]["id"]
-        payload = msg["successful_payment"].get("invoice_payload", "")
+        payment = msg["successful_payment"]
+        payload = payment.get("invoice_payload", "")
         plan = PAYMENT_PLANS.get(payload)
         if not plan:
             logging.error("Unknown successful payment payload: %s", payload)
             send(user_id, "❌ Не удалось определить оплаченный тариф. Напиши в поддержку.")
             return
+        telegram_charge_id = payment.get("telegram_payment_charge_id", "")
+        if telegram_charge_id:
+            db.save_payment(
+                user_id=user_id,
+                invoice_payload=payload,
+                total_amount=payment.get("total_amount", plan["stars"]),
+                currency=payment.get("currency", "XTR"),
+                telegram_payment_charge_id=telegram_charge_id,
+                provider_payment_charge_id=payment.get("provider_payment_charge_id", ""),
+            )
         db.set_subscription(user_id, payload, plan["days"])
         send(
             user_id,
@@ -299,6 +319,61 @@ def handle_update(update: dict):
             send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
             return
 
+        if user_id == ADMIN_ID and msg.get("reply_to_message"):
+            reply_to_message = msg["reply_to_message"]
+            target_id = db.get_support_message_link(reply_to_message.get("message_id"))
+            if target_id:
+                media_type, media_file_id = get_support_media(msg)
+                response_text = text or msg.get("caption") or ""
+                if media_type and media_file_id:
+                    caption = f"💬 <b>Ответ поддержки</b>\n\n{response_text}" if response_text else "💬 <b>Ответ поддержки</b>"
+                    send_file(target_id, media_file_id, media_type, caption)
+                elif response_text:
+                    send(target_id, f"💬 <b>Ответ поддержки</b>\n\n{response_text}", keyboard=main_keyboard())
+                else:
+                    send(chat_id, "❌ В ответе нет текста или поддерживаемого файла.")
+                    return
+                send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
+                return
+
+        if text.startswith("/refund ") and user_id == ADMIN_ID:
+            parts = text.split(maxsplit=2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                send(chat_id, "❌ Формат: /refund user_id telegram_payment_charge_id")
+                return
+            target_id = int(parts[1])
+            charge_id = parts[2].strip()
+            payment_row = db.get_payment(charge_id)
+            if payment_row and payment_row.get("refunded"):
+                send(chat_id, "ℹ️ Этот платёж уже отмечен как возвращённый.")
+                return
+            result = api(
+                "refundStarPayment",
+                user_id=target_id,
+                telegram_payment_charge_id=charge_id,
+            )
+            if result.get("ok"):
+                db.mark_payment_refunded(charge_id)
+                send(chat_id, f"✅ Возврат выполнен для user_id={target_id}.")
+                send(target_id, "✅ <b>Оплата возвращена.</b>\nStars должны вернуться на твой баланс Telegram.")
+            else:
+                send(chat_id, "❌ Не удалось сделать возврат. Проверь charge_id и логи.")
+            return
+
+        if text.startswith("/cancelsub ") and user_id == ADMIN_ID:
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].isdigit():
+                send(chat_id, "❌ Формат: /cancelsub user_id")
+                return
+            target_id = int(parts[1])
+            db.set_subscription(target_id, "expired", 0)
+            send(chat_id, f"✅ Подписка пользователя {target_id} отменена.")
+            try:
+                send(target_id, "⚠️ <b>Подписка отключена администратором.</b>", keyboard=main_keyboard())
+            except Exception:
+                pass
+            return
+
         if s.get("support_mode") and user_id != ADMIN_ID:
             username = user.get("username")
             first_name = user.get("first_name") or "Без имени"
@@ -311,10 +386,11 @@ def handle_update(update: dict):
                 f"{'🔗 @' + username if username else '🔗 username не указан'}\n\n"
                 f"<b>Сообщение:</b>\n{message_body}"
             )
+            header_result = send(ADMIN_ID, header)
+            save_support_link_from_result(header_result, user_id)
             if media_type and media_file_id:
-                send_file(ADMIN_ID, media_file_id, media_type, header)
-            else:
-                send(ADMIN_ID, header)
+                media_result = send_file(ADMIN_ID, media_file_id, media_type)
+                save_support_link_from_result(media_result, user_id)
             s["support_mode"] = False
             db.save_user_settings(user_id, s["track_deleted"], s["track_edited"], s["support_mode"])
             send(
@@ -477,11 +553,15 @@ def handle_update(update: dict):
                 f"🔗 Подключений: {connections}\n\n"
                 f"🆓 Trial: {trial} | 💳 Платных: {paid} | 🚫 Бан: {banned}\n\n"
                 f"🕐 <b>Последние подключения:</b>{recent_text or ' нет'}\n\n"
-                f"<b>Команды:</b>\n"
-                f"/sub @user monthly|yearly|trial\n"
-                f"/ban @user | /unban @user\n"
-                f"/users\n"
-                f"/reply user_id текст\n"
+                f"<b>Команды:</b>\n\n"
+                f"/sub @user monthly|yearly|trial — выдать подписку\n"
+                f"/ban @user — забанить пользователя\n"
+                f"/unban @user — разбанить и дать 14 дней trial\n"
+                f"/users — список пользователей\n"
+                f"/reply user_id текст — ответить в поддержку вручную\n"
+                f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
+                f"/refund user_id telegram_payment_charge_id — вернуть Stars\n"
+                f"/cancelsub user_id — отключить подписку без возврата\n"
                 f"/admin"
             )
 
