@@ -1,6 +1,5 @@
 """
 База данных на SQLite
-Хранит пользователей и кэш сообщений из бизнес-чатов
 """
 
 import sqlite3
@@ -12,7 +11,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Пользователи бота (те кто написал /start)
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id     INTEGER PRIMARY KEY,
@@ -21,17 +19,15 @@ def init_db():
         )
     """)
 
-    # Бизнес-подключения: business_connection_id -> user_id владельца
     c.execute("""
         CREATE TABLE IF NOT EXISTS connections (
             connection_id   TEXT PRIMARY KEY,
-            owner_id        INTEGER,   -- user_id кто подключил бота
+            owner_id        INTEGER,
             is_enabled      INTEGER DEFAULT 1,
             connected_at    TEXT DEFAULT (datetime('now'))
         )
     """)
 
-    # Кэш сообщений из бизнес-чатов
     c.execute("""
         CREATE TABLE IF NOT EXISTS message_cache (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +36,21 @@ def init_db():
             msg_id          INTEGER,
             sender_name     TEXT,
             text            TEXT,
+            date            TEXT,
+            UNIQUE(connection_id, chat_id, msg_id)
+        )
+    """)
+
+    # Кэш медиа (голосовые, кружочки, аудио)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS media_cache (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id   TEXT,
+            chat_id         INTEGER,
+            msg_id          INTEGER,
+            sender_name     TEXT,
+            file_type       TEXT,
+            file_id         TEXT,
             date            TEXT,
             UNIQUE(connection_id, chat_id, msg_id)
         )
@@ -88,7 +99,7 @@ def save_connection(connection_id: str, owner_id: int, is_enabled: bool):
     conn.close()
 
 
-def get_owner_by_connection(connection_id: str) -> int | None:
+def get_owner_by_connection(connection_id: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT owner_id FROM connections WHERE connection_id = ?", (connection_id,))
@@ -106,7 +117,17 @@ def get_connections_count() -> int:
     return count
 
 
-# ── Кэш сообщений ─────────────────────────────────────────
+def get_connections_count_for_user(user_id: int) -> int:
+    """Проверяем есть ли активное подключение у конкретного пользователя"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = ? AND is_enabled = 1", (user_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+
+# ── Кэш текстовых сообщений ───────────────────────────────
 
 def cache_message(connection_id: str, chat_id: int, msg_id: int,
                   sender_name: str, text: str, date: str):
@@ -152,6 +173,45 @@ def delete_cached_message(connection_id: str, chat_id: int, msg_id: int):
     c = conn.cursor()
     c.execute("""
         DELETE FROM message_cache
+        WHERE connection_id = ? AND chat_id = ? AND msg_id = ?
+    """, (connection_id, chat_id, msg_id))
+    conn.commit()
+    conn.close()
+
+
+# ── Кэш медиа ─────────────────────────────────────────────
+
+def cache_media(connection_id: str, chat_id: int, msg_id: int,
+                sender_name: str, file_type: str, file_id: str, date: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO media_cache (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(connection_id, chat_id, msg_id) DO NOTHING
+    """, (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date))
+    conn.commit()
+    conn.close()
+
+
+def get_cached_media(connection_id: str, chat_id: int, msg_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT * FROM media_cache
+        WHERE connection_id = ? AND chat_id = ? AND msg_id = ?
+    """, (connection_id, chat_id, msg_id))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_cached_media(connection_id: str, chat_id: int, msg_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        DELETE FROM media_cache
         WHERE connection_id = ? AND chat_id = ? AND msg_id = ?
     """, (connection_id, chat_id, msg_id))
     conn.commit()
