@@ -199,6 +199,67 @@ def resolve_user_identifier(value: str):
     return found["user_id"] if found else None
 
 
+def filter_users(query: str | None):
+    users = db.get_all_users()
+    if not query:
+        return users
+    normalized = query.strip().lower().lstrip("@")
+    if not normalized:
+        return users
+    result = []
+    for user in users:
+        user_id = str(user.get("user_id", ""))
+        username = (user.get("username") or "").lower()
+        first_name = (user.get("first_name") or "").lower()
+        if normalized in user_id or normalized in username or normalized in first_name:
+            result.append(user)
+    return result
+
+
+def render_user_line(user: dict) -> str:
+    uid = user["user_id"]
+    name = user.get("first_name") or user.get("username") or str(uid)
+    if user.get("username"):
+        link = f'<a href="https://t.me/{user["username"]}">@{user["username"]}</a>'
+    else:
+        link = f'<a href="tg://user?id={uid}">{name}</a>'
+    sub = user.get("sub_type", "?")
+    exp = format_db_date(user.get("sub_expires"))
+    sub_icon = "✅" if db.is_sub_active(uid) else "❌"
+    conn_count = db.get_connections_count_for_user(uid)
+    automation_status = "🔗 автоподкл" if conn_count else "➖ не подключен"
+    return f"{sub_icon} {link} · <code>{uid}</code> · {sub} до {exp} · {automation_status}"
+
+
+def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
+    per_page = 10
+    total = len(users)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    chunk = users[start:start + per_page]
+
+    header = "👥 <b>Пользователи:</b>\n"
+    if query:
+        header += f"🔎 Поиск: <code>{query}</code>\n"
+    header += f"📄 Страница {page}/{total_pages} · Всего: {total}\n\n"
+
+    if not chunk:
+        text = header + "Ничего не найдено."
+    else:
+        text = header + "\n".join(render_user_line(user) for user in chunk)
+
+    nav_row = []
+    encoded_query = query.replace(" ", "%20") if query else ""
+    if page > 1:
+        nav_row.append({"text": "⬅️", "callback_data": f"users:{page-1}:{encoded_query}"})
+    if page < total_pages:
+        nav_row.append({"text": "➡️", "callback_data": f"users:{page+1}:{encoded_query}"})
+
+    keyboard = {"inline_keyboard": [nav_row]} if nav_row else None
+    return text, keyboard
+
+
 def get_ref_link(user_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
@@ -642,11 +703,14 @@ def handle_update(update: dict):
         elif text in ("🔒 Приватность",):
             send(chat_id,
                 "🔒 <b>Приватность и безопасность</b>\n\n"
-                "✅ Бот видит только твои чаты\n"
-                "✅ Уведомления приходят только тебе\n"
-                "✅ Работает через официальный API Telegram\n"
-                "✅ Отключить можно в любой момент:\n"
-                "Профиль → Изм. → Автоматизация чатов → удали бота",
+                "✅ Бот работает через <b>официальный Telegram Bot API</b>\n"
+                "✅ Бот получает только события из тех чатов, где ты сам подключил его через <b>Автоматизацию чатов</b>\n"
+                "✅ Уведомления об удалённых и изменённых сообщениях приходят <b>только тебе</b>\n"
+                "✅ Другие пользователи не видят твои уведомления и не получают доступ к твоему боту\n"
+                "✅ Ты можешь в любой момент отключить бота и перестать получать события\n\n"
+                "<b>Как отключить:</b>\n"
+                "Профиль → Изм. → Автоматизация чатов → удалить бота\n\n"
+                "<i>Важно:</i> бот не читает весь Telegram целиком — только те диалоги, для которых ты сам дал доступ через настройки Telegram.",
                 keyboard=main_keyboard()
             )
 
@@ -691,7 +755,7 @@ def handle_update(update: dict):
                 f"/sub @user monthly|yearly|trial — выдать подписку\n"
                 f"/ban user_id|@user — забанить пользователя\n"
                 f"/unban user_id|@user — разбанить и дать 14 дней trial\n"
-                f"/users — список пользователей\n"
+                f"/users [user_id|@user] — список пользователей, поиск и страницы\n"
                 f"/reply user_id текст — ответить в поддержку вручную\n"
                 f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
                 f"/refund user_id telegram_payment_charge_id — вернуть Stars\n"
@@ -756,27 +820,12 @@ def handle_update(update: dict):
                 except Exception as e:
                     send(chat_id, f"❌ {e}")
 
-        elif text == "/users" and user_id == ADMIN_ID:
-            users = db.get_all_users()
-            if not users:
-                send(chat_id, "Нет пользователей.")
-                return
-            text_out = "👥 <b>Пользователи:</b>\n\n"
-            for u in users[:20]:
-                uid = u["user_id"]
-                name = u.get("first_name") or u.get("username") or str(uid)
-                if u.get("username"):
-                    link = f'<a href="https://t.me/{u["username"]}">@{u["username"]}</a>'
-                else:
-                    link = f'<a href="tg://user?id={uid}">{name}</a>'
-                sub = u.get("sub_type", "?")
-                exp = format_db_date(u.get("sub_expires"))
-                sub_icon = "✅" if db.is_sub_active(uid) else "❌"
-                # 🔗 = подключён, ➖ = отключён
-                conn_count = db.get_connections_count_for_user(uid)
-                conn_icon = "🔗" if conn_count else "➖"
-                text_out += f"{sub_icon}{conn_icon} {link} (id:{uid})\n    {sub} до {exp}\n\n"
-            send(chat_id, text_out)
+        elif text.startswith("/users") and user_id == ADMIN_ID:
+            parts = text.split(maxsplit=1)
+            query = parts[1].strip() if len(parts) > 1 else ""
+            users = filter_users(query)
+            text_out, keyboard = users_page_text_and_keyboard(users, page=1, query=query)
+            send(chat_id, text_out, keyboard=keyboard)
 
     # ── Callback кнопки ────────────────────────────────────
     elif "callback_query" in update:
@@ -785,7 +834,21 @@ def handle_update(update: dict):
         data = cq.get("data", "")
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data == "buy_weekly":
+        if data.startswith("users:") and user_id == ADMIN_ID:
+            _, page_str, encoded_query = data.split(":", 2)
+            page = int(page_str)
+            query = encoded_query.replace("%20", " ") if encoded_query else ""
+            users = filter_users(query)
+            text_out, keyboard = users_page_text_and_keyboard(users, page=page, query=query)
+            api(
+                "editMessageText",
+                chat_id=cq["message"]["chat"]["id"],
+                message_id=cq["message"]["message_id"],
+                text=text_out,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif data == "buy_weekly":
             plan = PAYMENT_PLANS["weekly"]
             send_invoice(user_id, plan["title"], "Dialog Spy Bot — 7 дней доступа", "weekly", plan["stars"])
         elif data == "buy_monthly":
