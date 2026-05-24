@@ -795,12 +795,22 @@ def handle_update(update: dict):
             user_data = db.get_user(user_id)
             sub_type = user_data.get("sub_type", "trial") if user_data else "trial"
             sub_expires = format_db_date(user_data.get("sub_expires")) if user_data else "—"
+            remaining_seconds = int(user_data.get("sub_remaining_seconds") or 0) if user_data else 0
+            if not is_connected:
+                sub_reason = "нет подключённых чатов"
+            elif sub_active:
+                sub_reason = "активна"
+            elif remaining_seconds > 0:
+                sub_reason = "пауза до следующего подключения"
+            else:
+                sub_reason = "истекла"
             del_icon = "✅" if s["track_deleted"] else "❌"
             edit_icon = "✅" if s["track_edited"] else "❌"
             send(chat_id,
                 f"📊 <b>Статус</b>\n\n"
                 f"Подключение: {status}\n"
-                f"Подписка: {'✅ Активна' if sub_active else '❌ Истекла'} ({sub_type})\n"
+                f"Подписка: {'✅ Активна' if sub_active else '❌ Не активна'} ({sub_type})\n"
+                f"Причина: {sub_reason}\n"
                 f"До: {sub_expires}\n"
                 f"Удалённые: {del_icon}\n"
                 f"Изменённые: {edit_icon}\n\n"
@@ -1143,7 +1153,7 @@ def handle_update(update: dict):
         else:
             if db.get_connections_count_for_user(owner_id) == 0:
                 db.pause_subscription(owner_id)
-            send(owner_id, "❌ Бот отключён.", keyboard=main_keyboard())
+            send(owner_id, "❌ Бот отключён.\n\nПричина: нет подключённых чатов.", keyboard=main_keyboard())
 
     # ── Новое сообщение из бизнес-чата ────────────────────
     elif "business_message" in update:
