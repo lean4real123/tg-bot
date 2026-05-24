@@ -1,6 +1,7 @@
 """Telegram Spy Bot for Telegram Business API."""
 
 import urllib.request
+import urllib.parse
 import json
 import time
 import logging
@@ -216,6 +217,34 @@ def filter_users(query: str | None):
     return result
 
 
+def is_user_sub_active_row(user: dict) -> bool:
+    if not user:
+        return False
+    if user.get("sub_type") == "banned":
+        return False
+    expires = user.get("sub_expires")
+    if not expires:
+        return True
+    if isinstance(expires, str):
+        try:
+            expires = datetime.strptime(expires[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return True
+    return datetime.now(MSK) < expires.replace(tzinfo=MSK) if getattr(expires, "tzinfo", None) is None else datetime.now(MSK) < expires.astimezone(MSK)
+
+
+def get_broadcast_targets(scope: str):
+    users = [user for user in db.get_all_users() if user.get("user_id") != ADMIN_ID]
+    if scope == "all":
+        return [user for user in users if user.get("sub_type") != "banned"]
+    if scope == "sub":
+        return [user for user in users if is_user_sub_active_row(user)]
+    if scope == "conn":
+        connected_ids = set(db.get_connected_owner_ids())
+        return [user for user in users if user.get("user_id") in connected_ids and user.get("sub_type") != "banned"]
+    return []
+
+
 def render_user_line(user: dict) -> str:
     uid = user["user_id"]
     name = user.get("first_name") or user.get("username") or str(uid)
@@ -227,8 +256,9 @@ def render_user_line(user: dict) -> str:
     exp = format_db_date(user.get("sub_expires"))
     sub_icon = "✅" if db.is_sub_active(uid) else "❌"
     conn_count = db.get_connections_count_for_user(uid)
+    ref_count = db.get_referral_count(uid)
     automation_status = "🔗 автоподкл" if conn_count else "➖ не подключен"
-    return f"{sub_icon} {link} · <code>{uid}</code> · {sub} до {exp} · {automation_status}"
+    return f"{sub_icon} {link} · <code>{uid}</code> · {sub} до {exp} · {automation_status} · реф: {ref_count}"
 
 
 def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
@@ -249,15 +279,191 @@ def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
     else:
         text = header + "\n".join(render_user_line(user) for user in chunk)
 
+    encoded_query = urllib.parse.quote(query) if query else ""
+    keyboard_rows = []
+    for user in chunk:
+        display_name = user.get("first_name") or user.get("username") or str(user["user_id"])
+        keyboard_rows.append([{
+            "text": f"ℹ️ {display_name[:24]}",
+            "callback_data": f"userstat:{user['user_id']}:{page}:{encoded_query}",
+        }])
+
+    keyboard_rows.append([
+        {"text": "🎁 Реферальная программа", "callback_data": f"users:ref:{page}:{encoded_query}"},
+        {"text": "📊 Аналитика", "callback_data": f"users:analytics:{page}:{encoded_query}"},
+    ])
+
     nav_row = []
-    encoded_query = query.replace(" ", "%20") if query else ""
     if page > 1:
         nav_row.append({"text": "⬅️", "callback_data": f"users:{page-1}:{encoded_query}"})
     if page < total_pages:
         nav_row.append({"text": "➡️", "callback_data": f"users:{page+1}:{encoded_query}"})
+    if nav_row:
+        keyboard_rows.append(nav_row)
 
-    keyboard = {"inline_keyboard": [nav_row]} if nav_row else None
+    keyboard = {"inline_keyboard": keyboard_rows} if keyboard_rows else None
     return text, keyboard
+
+
+def user_stats_text(user_id: int, page: int = 1, query: str = "") -> tuple[str, dict | None]:
+    user = db.get_user(user_id) or {}
+    username = user.get("username")
+    first_name = user.get("first_name") or "Без имени"
+    ref_count = db.get_referral_count(user_id)
+    referred_by = db.get_referrer_for_user(user_id)
+    connections = db.get_connections_count_for_user(user_id)
+    payments = db.get_payments_by_user(user_id, limit=5)
+    payments_count = db.get_payments_count_by_user(user_id)
+    referral_line = f"<code>{referred_by}</code>" if referred_by else "—"
+    status = "активна" if db.is_sub_active(user_id) else "истекла"
+    username_line = f"@{username}" if username else "—"
+    text = (
+        f"👤 <b>Статистика пользователя</b>\n\n"
+        f"Имя: {first_name}\n"
+        f"Username: {username_line}\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Подписка: {user.get('sub_type', 'trial')} ({status})\n"
+        f"Подключений: {connections}\n"
+        f"Пригласил людей: {ref_count}\n"
+        f"Пригласил его: {referral_line}\n"
+        f"Платежей: {payments_count}\n"
+    )
+    if payments:
+        last_payment = payments[0]
+        refunded = "да" if last_payment.get("refunded") else "нет"
+        text += (
+            f"\n<b>Последний платеж:</b>\n"
+            f"План: {last_payment.get('invoice_payload')}\n"
+            f"Сумма: {last_payment.get('total_amount')} {last_payment.get('currency')}\n"
+            f"Возврат: {refunded}\n"
+        )
+    encoded_query = urllib.parse.quote(query) if query else ""
+    keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:{page}:{encoded_query}"}]]}
+    return text, keyboard
+
+
+def referrals_text(page: int = 1, query: str = "") -> tuple[str, dict | None]:
+    leaderboard = db.get_referral_leaderboard(limit=15)
+    total_referrals = sum(item.get("referrals_count", 0) for item in leaderboard)
+    lines = ["🎁 <b>Реферальная программа</b>", "", f"Всего приглашений в топе: <b>{total_referrals}</b>", ""]
+    for index, item in enumerate(leaderboard, start=1):
+        user_id = item.get("referrer_id")
+        username = item.get("username")
+        name = item.get("first_name") or username or str(user_id)
+        referred = db.get_referrals_by_referrer(user_id)
+        preview = []
+        for row in referred[:5]:
+            referred_name = row.get("first_name") or row.get("username") or str(row.get("referred_id"))
+            if row.get("username"):
+                referred_name = f"@{row['username']}"
+            preview.append(referred_name)
+        preview_text = ", ".join(preview) if preview else "нет"
+        lines.append(
+            f"{index}. {name} (<code>{user_id}</code>) — <b>{item.get('referrals_count', 0)}</b>\n"
+            f"   Кого привёл: {preview_text}"
+        )
+    encoded_query = urllib.parse.quote(query) if query else ""
+    keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:{page}:{encoded_query}"}]]}
+    return "\n".join(lines), keyboard
+
+
+def analytics_text(owner_id: int, page: int = 1, query: str = "") -> tuple[str, dict | None]:
+    deleted_stats = db.get_deleted_sender_stats(owner_id, limit=7)
+    photo_count = db.get_monthly_photo_count(owner_id)
+    activity = db.get_activity_by_day(owner_id, days=14)
+    heatmap = db.get_heatmap_by_hour(owner_id)
+    total_activity = sum(int(item.get("count", 0)) for item in activity)
+
+    lines = [
+        "📊 <b>Аналитика</b>",
+        "",
+        "ℹ️ Telegram не отдаёт, кто именно удалил сообщение. Показываю, чьи сообщения чаще удаляются.",
+        "ℹ️ View-once фото Bot API отдельно не отдаёт, поэтому считаю обычные фото за 30 дней.",
+        "",
+        f"📷 Фото за 30 дней: <b>{photo_count}</b>",
+        f"💬 Сообщений за 14 дней: <b>{total_activity}</b>",
+        "",
+        "🗑 <b>Чьи сообщения удаляются чаще:</b>",
+    ]
+    if deleted_stats:
+        for index, item in enumerate(deleted_stats, start=1):
+            sender_name = item.get("sender_name") or item.get("sender_username") or str(item.get("sender_id") or "—")
+            if item.get("sender_username"):
+                sender_name = f"@{item['sender_username']}"
+            lines.append(f"{index}. {sender_name} — <b>{item.get('deleted_count', 0)}</b>")
+    else:
+        lines.append("Пока нет данных.")
+
+    lines.extend(["", "📈 <b>Активность по дням:</b>"])
+    for item in activity:
+        day = item.get("day")
+        if hasattr(day, "strftime"):
+            day = day.strftime("%d.%m")
+        lines.append(f"{day} — {item.get('count', 0)}")
+
+    days_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    heatmap_grid = {(int(item["dow"]), int(item["hour"])): int(item["count"]) for item in heatmap}
+    max_value = max(heatmap_grid.values()) if heatmap_grid else 0
+    shades = " ▁▂▃▄▅▆▇█"
+    lines.extend(["", "🔥 <b>Heatmap по часам:</b>"])
+    for dow in range(7):
+        row = []
+        for hour in range(24):
+            value = heatmap_grid.get((dow, hour), 0)
+            if max_value:
+                shade_index = min(8, int(round((value / max_value) * 8)))
+            else:
+                shade_index = 0
+            row.append(shades[shade_index])
+        lines.append(f"{days_names[dow]} {' '.join(row)}")
+
+    encoded_query = urllib.parse.quote(query) if query else ""
+    keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:{page}:{encoded_query}"}]]}
+    return "\n".join(lines), keyboard
+
+
+def copy_message(chat_id: int, from_chat_id: int, message_id: int):
+    result = api(
+        "copyMessage",
+        chat_id=chat_id,
+        from_chat_id=from_chat_id,
+        message_id=message_id,
+    )
+    if not result.get("ok"):
+        logging.error("copyMessage failed for chat_id=%s from_chat_id=%s message_id=%s", chat_id, from_chat_id, message_id)
+    return result
+
+
+def run_broadcast(scope: str, source_chat_id: int, text: str | None = None, source_message_id: int | None = None):
+    targets = get_broadcast_targets(scope)
+    if not targets:
+        return {"sent": 0, "failed": 0, "total": 0}
+
+    sent = 0
+    failed = 0
+    for user in targets:
+        target_id = user["user_id"]
+        try:
+            if source_message_id is not None:
+                result = copy_message(target_id, source_chat_id, source_message_id)
+            else:
+                result = send(target_id, text or "")
+            if not result.get("ok") and result.get("error_code") == 429:
+                retry_after = result.get("parameters", {}).get("retry_after", 2)
+                time.sleep(int(retry_after))
+                if source_message_id is not None:
+                    result = copy_message(target_id, source_chat_id, source_message_id)
+                else:
+                    result = send(target_id, text or "")
+            if result.get("ok"):
+                sent += 1
+            else:
+                failed += 1
+            time.sleep(0.03)
+        except Exception as exc:
+            failed += 1
+            logging.error("Broadcast error for %s: %s", target_id, exc)
+    return {"sent": sent, "failed": failed, "total": len(targets)}
 
 
 def get_ref_link(user_id: int) -> str:
@@ -396,10 +602,13 @@ def handle_update(update: dict):
 
         if text.startswith("/reply ") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=2)
-            if len(parts) < 3 or not parts[1].isdigit():
-                send(chat_id, "❌ Формат: /reply user_id текст")
+            if len(parts) < 3:
+                send(chat_id, "❌ Формат: /reply user_id|@user текст")
                 return
-            target_id = int(parts[1])
+            target_id = resolve_user_identifier(parts[1])
+            if not target_id:
+                send(chat_id, "❌ Пользователь не найден.")
+                return
             reply_text = parts[2].strip()
             send(target_id, f"💬 <b>Ответ поддержки</b>\n\n{reply_text}", keyboard=main_keyboard())
             send(chat_id, f"✅ Ответ отправлен пользователю {target_id}.")
@@ -494,14 +703,20 @@ def handle_update(update: dict):
 
         if text.startswith("/refund ") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=2)
-            if len(parts) < 3 or not parts[1].isdigit():
-                send(chat_id, "❌ Формат: /refund user_id telegram_payment_charge_id")
+            if len(parts) < 3:
+                send(chat_id, "❌ Формат: /refund user_id|@user telegram_payment_charge_id")
                 return
-            target_id = int(parts[1])
+            target_id = resolve_user_identifier(parts[1])
+            if not target_id:
+                send(chat_id, "❌ Пользователь не найден.")
+                return
             charge_id = parts[2].strip()
             payment_row = db.get_payment(charge_id)
             if payment_row and payment_row.get("refunded"):
                 send(chat_id, "ℹ️ Этот платёж уже отмечен как возвращённый.")
+                return
+            if payment_row and int(payment_row.get("user_id", 0)) != target_id:
+                send(chat_id, "❌ Этот charge_id не принадлежит указанному пользователю.")
                 return
             result = api(
                 "refundStarPayment",
@@ -706,6 +921,7 @@ def handle_update(update: dict):
                 "✅ Бот работает через <b>официальный Telegram Bot API</b>\n"
                 "✅ Уведомления об удалённых и изменённых сообщениях приходят <b>только тебе</b>\n"
                 "✅ Другие пользователи не видят твои уведомления и не получают доступ к твоему боту\n"
+                "✅ Бот сохраняет только имена и username для статистики и поиска\n"
                 "✅ Ты можешь в любой момент отключить бота и перестать получать события\n\n"
                 "<b>Как отключить:</b>\n"
                 "Профиль → Изм. → Автоматизация чатов → удалить бота\n\n",
@@ -724,7 +940,7 @@ def handle_update(update: dict):
                 "2️⃣ <b>Чат-боты</b>\n"
                 f"3️⃣ Введи <code>@{BOT_USERNAME}</code> → <b>Добавить</b>\n\n"
                 "⚠️ <i>Если раздел не появляется — обнови Telegram</i>",
-                keyboard=main_keyboard()
+                keyboard={"inline_keyboard": [[{"text": "⚙️ Открыть настройки", "url": "tg://settings"}]]}
             )
 
         elif text == "/admin" and user_id == ADMIN_ID:
@@ -754,13 +970,18 @@ def handle_update(update: dict):
                 f"/ban user_id|@user — забанить пользователя\n"
                 f"/unban user_id|@user — разбанить и дать 14 дней trial\n"
                 f"/users [user_id|@user] — список пользователей, поиск и страницы\n"
+                f"Кнопка в /users: 🎁 реферальная программа и 📊 аналитика\n"
                 f"/reply user_id текст — ответить в поддержку вручную\n"
                 f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
-                f"/refund user_id telegram_payment_charge_id — вернуть Stars\n"
+                f"/refund user_id|@user telegram_payment_charge_id — вернуть Stars\n"
                 f"/cancelsub user_id|@user — отключить подписку без возврата\n"
                 f"/closesupport user_id|@user — закрыть диалог поддержки\n"
                 f"/supportlist — активные диалоги поддержки\n"
                 f"/payments user_id|@user — последние платежи пользователя\n"
+                f"/analytics — аналитика активности и удалений\n"
+                f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
+                f"/bdsub [текст] — рассылка только активным подписчикам\n"
+                f"/bdconn [текст] — рассылка только подключённым\n"
                 f"/admin"
             )
 
@@ -768,17 +989,12 @@ def handle_update(update: dict):
             parts = text.split()
             if len(parts) >= 3:
                 try:
-                    target = parts[1].lstrip("@")
                     sub_type = parts[2]
                     days = {"trial": 14, "monthly": 30, "yearly": 365}.get(sub_type, 30)
-                    if target.isdigit():
-                        target_id = int(target)
-                    else:
-                        found = next((u for u in db.get_all_users() if (u.get("username") or "").lower() == target.lower()), None)
-                        if not found:
-                            send(chat_id, f"❌ @{target} не найден.")
-                            return
-                        target_id = found["user_id"]
+                    target_id = resolve_user_identifier(parts[1])
+                    if not target_id:
+                        send(chat_id, f"❌ {parts[1]} не найден.")
+                        return
                     db.set_subscription(target_id, sub_type, days)
                     send(chat_id, f"✅ {sub_type} выдан {target_id} на {days} дней.")
                 except Exception as e:
@@ -818,11 +1034,69 @@ def handle_update(update: dict):
                 except Exception as e:
                     send(chat_id, f"❌ {e}")
 
+        elif user_id == ADMIN_ID and (
+            text.startswith("/bd")
+            or text.startswith("/broadcast")
+        ):
+            command = text.split(maxsplit=1)[0].lower()
+            scope_map = {
+                "/bd": "all",
+                "/broadcast": "all",
+                "/bdsub": "sub",
+                "/broadcastsub": "sub",
+                "/bdconn": "conn",
+                "/broadcastconn": "conn",
+            }
+            scope = scope_map.get(command)
+            if not scope:
+                send(chat_id, "❌ Используй /bd, /bdsub или /bdconn.")
+                return
+
+            parts = text.split(maxsplit=1)
+            broadcast_text = parts[1].strip() if len(parts) > 1 else ""
+            source_message_id = None
+            if not broadcast_text:
+                reply = msg.get("reply_to_message")
+                if reply:
+                    source_message_id = reply.get("message_id")
+                    source_chat_id = msg["chat"]["id"]
+                else:
+                    send(chat_id, f"❌ Формат: {command} текст или {command} в ответ на сообщение")
+                    return
+            else:
+                source_chat_id = None
+
+            targets = get_broadcast_targets(scope)
+            if not targets:
+                send(chat_id, "ℹ️ Нет получателей для рассылки.")
+                return
+
+            scope_label = {"all": "всем пользователям", "sub": "активным подписчикам", "conn": "подключённым"}[scope]
+            send(chat_id, f"🔄 Рассылка запущена {scope_label}. Получателей: {len(targets)}")
+            result = run_broadcast(
+                scope=scope,
+                source_chat_id=source_chat_id or msg["chat"]["id"],
+                text=broadcast_text or None,
+                source_message_id=source_message_id,
+            )
+            send(
+                chat_id,
+                f"✅ Рассылка завершена.\n"
+                f"Получателей: {result['total']}\n"
+                f"Отправлено: {result['sent']}\n"
+                f"Ошибок: {result['failed']}"
+            )
+            return
+
         elif text.startswith("/users") and user_id == ADMIN_ID:
             parts = text.split(maxsplit=1)
             query = parts[1].strip() if len(parts) > 1 else ""
             users = filter_users(query)
             text_out, keyboard = users_page_text_and_keyboard(users, page=1, query=query)
+            send(chat_id, text_out, keyboard=keyboard)
+
+        elif text == "/analytics" and user_id == ADMIN_ID:
+            text_out, keyboard = analytics_text(None, page=1, query="")
             send(chat_id, text_out, keyboard=keyboard)
 
     # ── Callback кнопки ────────────────────────────────────
@@ -832,10 +1106,50 @@ def handle_update(update: dict):
         data = cq.get("data", "")
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data.startswith("users:") and user_id == ADMIN_ID:
+        if data.startswith("userstat:") and user_id == ADMIN_ID:
+            _, target_str, page_str, encoded_query = data.split(":", 3)
+            target_id = int(target_str)
+            page = int(page_str)
+            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
+            text_out, keyboard = user_stats_text(target_id, page=page, query=query)
+            api(
+                "editMessageText",
+                chat_id=cq["message"]["chat"]["id"],
+                message_id=cq["message"]["message_id"],
+                text=text_out,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif data.startswith("users:ref:") and user_id == ADMIN_ID:
+            _, _, page_str, encoded_query = data.split(":", 3)
+            page = int(page_str)
+            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
+            text_out, keyboard = referrals_text(page=page, query=query)
+            api(
+                "editMessageText",
+                chat_id=cq["message"]["chat"]["id"],
+                message_id=cq["message"]["message_id"],
+                text=text_out,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif data.startswith("users:analytics:") and user_id == ADMIN_ID:
+            _, _, page_str, encoded_query = data.split(":", 3)
+            page = int(page_str)
+            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
+            text_out, keyboard = analytics_text(None, page=page, query=query)
+            api(
+                "editMessageText",
+                chat_id=cq["message"]["chat"]["id"],
+                message_id=cq["message"]["message_id"],
+                text=text_out,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif data.startswith("users:") and user_id == ADMIN_ID:
             _, page_str, encoded_query = data.split(":", 2)
             page = int(page_str)
-            query = encoded_query.replace("%20", " ") if encoded_query else ""
+            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
             users = filter_users(query)
             text_out, keyboard = users_page_text_and_keyboard(users, page=page, query=query)
             api(
@@ -905,22 +1219,36 @@ def handle_update(update: dict):
 
         date_str = format_ts_msk(msg["date"])
         sender_link = get_user_link(sender)
+        chat = msg.get("chat", {})
+        chat_name = chat.get("title") or chat.get("first_name") or chat.get("username") or str(chat.get("id", ""))
+        sender_name = sender.get("first_name") or sender.get("username") or sender.get("last_name") or "Без имени"
+        message_date = datetime.fromtimestamp(msg["date"], MSK).replace(tzinfo=None)
+        sender_id = sender.get("id")
+        sender_username = sender.get("username", "")
 
         if msg.get("text"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "text", message_date)
             db.cache_message(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, msg["text"], date_str)
         elif msg.get("voice"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "voice", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "voice", msg["voice"]["file_id"], date_str)
         elif msg.get("video_note"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "video_note", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "video_note", msg["video_note"]["file_id"], date_str)
         elif msg.get("audio"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "audio", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "audio", msg["audio"]["file_id"], date_str)
         elif msg.get("photo"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "photo", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "photo", msg["photo"][-1]["file_id"], date_str)
         elif msg.get("video"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "video", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "video", msg["video"]["file_id"], date_str)
         elif msg.get("document"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "document", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "document", msg["document"]["file_id"], date_str)
         elif msg.get("sticker"):
+            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "sticker", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "sticker", msg["sticker"]["file_id"], date_str)
 
     # ── Изменённое сообщение ───────────────────────────────
@@ -948,6 +1276,7 @@ def handle_update(update: dict):
                 f"<b>Стало:</b>\n{new_text}"
             )
             db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
+            db.mark_message_event_edited(conn_id, msg["chat"]["id"], msg["message_id"])
 
     # ── Удалённые сообщения ────────────────────────────────
     elif "deleted_business_messages" in update:
@@ -975,6 +1304,7 @@ def handle_update(update: dict):
                     f"<b>Текст:</b>\n{original['text']}"
                 )
                 db.delete_cached_message(conn_id, event["chat"]["id"], msg_id)
+                db.mark_message_event_deleted(conn_id, event["chat"]["id"], msg_id)
                 continue
 
             media = db.get_cached_media(conn_id, event["chat"]["id"], msg_id)
@@ -982,6 +1312,7 @@ def handle_update(update: dict):
                 caption = f"🗑️ <b>Удалено</b> · {media['file_type']}\n👤 {chat_link}\n🕐 {media['date']}"
                 send_file(owner_id, media["file_id"], media["file_type"], caption)
                 db.delete_cached_media(conn_id, event["chat"]["id"], msg_id)
+            db.mark_message_event_deleted(conn_id, event["chat"]["id"], msg_id)
 
 
 def main():
