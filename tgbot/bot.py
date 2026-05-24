@@ -2,6 +2,7 @@
 
 import urllib.request
 import urllib.parse
+import mimetypes
 import json
 import time
 import logging
@@ -19,6 +20,10 @@ from config import BOT_TOKEN, ADMIN_ID, PORT
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+INSTRUCTION_IMAGE_PATHS = [
+    os.path.join(os.path.dirname(__file__), "instruction.jpg"),
+    os.path.join(os.path.dirname(__file__), "instruction.png"),
+]
 
 # Prices in Telegram Stars
 PRICE_WEEKLY = 45
@@ -120,6 +125,51 @@ def send(chat_id, text, keyboard=None):
     if not result.get("ok"):
         logging.error("sendMessage failed for chat_id=%s", chat_id)
     return result
+
+
+def send_photo(chat_id, photo_path, caption="", keyboard=None):
+    if not os.path.exists(photo_path):
+        logging.error("sendPhoto file not found: %s", photo_path)
+        return {"ok": False}
+
+    boundary = f"----CodexBoundary{int(time.time() * 1000)}"
+    body = bytearray()
+
+    def add_field(name, value):
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    add_field("chat_id", chat_id)
+    if caption:
+        add_field("caption", caption)
+        add_field("parse_mode", "HTML")
+    if keyboard:
+        add_field("reply_markup", json.dumps(keyboard, ensure_ascii=False))
+
+    mime_type = mimetypes.guess_type(photo_path)[0] or "image/png"
+    filename = os.path.basename(photo_path)
+    with open(photo_path, "rb") as photo_file:
+        photo_data = photo_file.read()
+
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
+    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
+    body.extend(photo_data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+    url = f"{BASE}/sendPhoto"
+    req = urllib.request.Request(url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            response = json.loads(r.read())
+            if not response.get("ok"):
+                logging.error("Telegram API returned error for sendPhoto: %s", response)
+            return response
+    except Exception as exc:
+        logging.error("sendPhoto failed for chat_id=%s path=%s: %s", chat_id, photo_path, exc)
+        return {"ok": False}
 
 
 def send_invoice(chat_id: int, title: str, description: str, payload: str, amount: int):
@@ -280,17 +330,8 @@ def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
         text = header + "\n".join(render_user_line(user) for user in chunk)
 
     encoded_query = urllib.parse.quote(query) if query else ""
-    keyboard_rows = []
-    for user in chunk:
-        display_name = user.get("first_name") or user.get("username") or str(user["user_id"])
-        keyboard_rows.append([{
-            "text": f"ℹ️ {display_name[:24]}",
-            "callback_data": f"userstat:{user['user_id']}:{page}:{encoded_query}",
-        }])
-
     keyboard_rows.append([
         {"text": "🎁 Реферальная программа", "callback_data": f"users:ref:{page}:{encoded_query}"},
-        {"text": "📊 Аналитика", "callback_data": f"users:analytics:{page}:{encoded_query}"},
     ])
 
     nav_row = []
@@ -302,43 +343,6 @@ def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
         keyboard_rows.append(nav_row)
 
     keyboard = {"inline_keyboard": keyboard_rows} if keyboard_rows else None
-    return text, keyboard
-
-
-def user_stats_text(user_id: int, page: int = 1, query: str = "") -> tuple[str, dict | None]:
-    user = db.get_user(user_id) or {}
-    username = user.get("username")
-    first_name = user.get("first_name") or "Без имени"
-    ref_count = db.get_referral_count(user_id)
-    referred_by = db.get_referrer_for_user(user_id)
-    connections = db.get_connections_count_for_user(user_id)
-    payments = db.get_payments_by_user(user_id, limit=5)
-    payments_count = db.get_payments_count_by_user(user_id)
-    referral_line = f"<code>{referred_by}</code>" if referred_by else "—"
-    status = "активна" if db.is_sub_active(user_id) else "истекла"
-    username_line = f"@{username}" if username else "—"
-    text = (
-        f"👤 <b>Статистика пользователя</b>\n\n"
-        f"Имя: {first_name}\n"
-        f"Username: {username_line}\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Подписка: {user.get('sub_type', 'trial')} ({status})\n"
-        f"Подключений: {connections}\n"
-        f"Пригласил людей: {ref_count}\n"
-        f"Пригласил его: {referral_line}\n"
-        f"Платежей: {payments_count}\n"
-    )
-    if payments:
-        last_payment = payments[0]
-        refunded = "да" if last_payment.get("refunded") else "нет"
-        text += (
-            f"\n<b>Последний платеж:</b>\n"
-            f"План: {last_payment.get('invoice_payload')}\n"
-            f"Сумма: {last_payment.get('total_amount')} {last_payment.get('currency')}\n"
-            f"Возврат: {refunded}\n"
-        )
-    encoded_query = urllib.parse.quote(query) if query else ""
-    keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:{page}:{encoded_query}"}]]}
     return text, keyboard
 
 
@@ -362,61 +366,6 @@ def referrals_text(page: int = 1, query: str = "") -> tuple[str, dict | None]:
             f"{index}. {name} (<code>{user_id}</code>) — <b>{item.get('referrals_count', 0)}</b>\n"
             f"   Кого привёл: {preview_text}"
         )
-    encoded_query = urllib.parse.quote(query) if query else ""
-    keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:{page}:{encoded_query}"}]]}
-    return "\n".join(lines), keyboard
-
-
-def analytics_text(owner_id: int, page: int = 1, query: str = "") -> tuple[str, dict | None]:
-    deleted_stats = db.get_deleted_sender_stats(owner_id, limit=7)
-    photo_count = db.get_monthly_photo_count(owner_id)
-    activity = db.get_activity_by_day(owner_id, days=14)
-    heatmap = db.get_heatmap_by_hour(owner_id)
-    total_activity = sum(int(item.get("count", 0)) for item in activity)
-
-    lines = [
-        "📊 <b>Аналитика</b>",
-        "",
-        "ℹ️ Telegram не отдаёт, кто именно удалил сообщение. Показываю, чьи сообщения чаще удаляются.",
-        "ℹ️ View-once фото Bot API отдельно не отдаёт, поэтому считаю обычные фото за 30 дней.",
-        "",
-        f"📷 Фото за 30 дней: <b>{photo_count}</b>",
-        f"💬 Сообщений за 14 дней: <b>{total_activity}</b>",
-        "",
-        "🗑 <b>Чьи сообщения удаляются чаще:</b>",
-    ]
-    if deleted_stats:
-        for index, item in enumerate(deleted_stats, start=1):
-            sender_name = item.get("sender_name") or item.get("sender_username") or str(item.get("sender_id") or "—")
-            if item.get("sender_username"):
-                sender_name = f"@{item['sender_username']}"
-            lines.append(f"{index}. {sender_name} — <b>{item.get('deleted_count', 0)}</b>")
-    else:
-        lines.append("Пока нет данных.")
-
-    lines.extend(["", "📈 <b>Активность по дням:</b>"])
-    for item in activity:
-        day = item.get("day")
-        if hasattr(day, "strftime"):
-            day = day.strftime("%d.%m")
-        lines.append(f"{day} — {item.get('count', 0)}")
-
-    days_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-    heatmap_grid = {(int(item["dow"]), int(item["hour"])): int(item["count"]) for item in heatmap}
-    max_value = max(heatmap_grid.values()) if heatmap_grid else 0
-    shades = " ▁▂▃▄▅▆▇█"
-    lines.extend(["", "🔥 <b>Heatmap по часам:</b>"])
-    for dow in range(7):
-        row = []
-        for hour in range(24):
-            value = heatmap_grid.get((dow, hour), 0)
-            if max_value:
-                shade_index = min(8, int(round((value / max_value) * 8)))
-            else:
-                shade_index = 0
-            row.append(shades[shade_index])
-        lines.append(f"{days_names[dow]} {' '.join(row)}")
-
     encoded_query = urllib.parse.quote(query) if query else ""
     keyboard = {"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": f"users:{page}:{encoded_query}"}]]}
     return "\n".join(lines), keyboard
@@ -929,7 +878,7 @@ def handle_update(update: dict):
             )
 
         elif text in ("📖 Инструкция",):
-            send(chat_id,
+            instruction_caption = (
                 "⚙️ <b>Как подключить:</b>\n\n"
                 "<b>Способ 1 — Новая версия Telegram:</b>\n"
                 "1️⃣ Открой профиль → <b>Изм.</b>\n"
@@ -939,9 +888,14 @@ def handle_update(update: dict):
                 "1️⃣ Настройки → <b>Telegram для бизнеса</b>\n"
                 "2️⃣ <b>Чат-боты</b>\n"
                 f"3️⃣ Введи <code>@{BOT_USERNAME}</code> → <b>Добавить</b>\n\n"
-                "⚠️ <i>Если раздел не появляется — обнови Telegram</i>",
-                keyboard={"inline_keyboard": [[{"text": "⚙️ Открыть настройки", "url": "tg://settings"}]]}
+                "⚠️ <i>Если раздел не появляется — обнови Telegram</i>"
             )
+            instruction_keyboard = {"inline_keyboard": [[{"text": "⚙️ Открыть настройки", "url": "tg://settings/edit"}]]}
+            instruction_image_path = next((path for path in INSTRUCTION_IMAGE_PATHS if os.path.exists(path)), None)
+            if instruction_image_path:
+                send_photo(chat_id, instruction_image_path, caption=instruction_caption, keyboard=instruction_keyboard)
+            else:
+                send(chat_id, instruction_caption + "\n\n<i>Положи файл <code>instruction.jpg</code> или <code>instruction.png</code> рядом с ботом, и он будет отправляться как картинка.</i>", keyboard=instruction_keyboard)
 
         elif text == "/admin" and user_id == ADMIN_ID:
             users = db.get_all_users()
@@ -1106,38 +1060,11 @@ def handle_update(update: dict):
         data = cq.get("data", "")
         api("answerCallbackQuery", callback_query_id=cq["id"])
 
-        if data.startswith("userstat:") and user_id == ADMIN_ID:
-            _, target_str, page_str, encoded_query = data.split(":", 3)
-            target_id = int(target_str)
-            page = int(page_str)
-            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
-            text_out, keyboard = user_stats_text(target_id, page=page, query=query)
-            api(
-                "editMessageText",
-                chat_id=cq["message"]["chat"]["id"],
-                message_id=cq["message"]["message_id"],
-                text=text_out,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        elif data.startswith("users:ref:") and user_id == ADMIN_ID:
+        if data.startswith("users:ref:") and user_id == ADMIN_ID:
             _, _, page_str, encoded_query = data.split(":", 3)
             page = int(page_str)
             query = urllib.parse.unquote(encoded_query) if encoded_query else ""
             text_out, keyboard = referrals_text(page=page, query=query)
-            api(
-                "editMessageText",
-                chat_id=cq["message"]["chat"]["id"],
-                message_id=cq["message"]["message_id"],
-                text=text_out,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        elif data.startswith("users:analytics:") and user_id == ADMIN_ID:
-            _, _, page_str, encoded_query = data.split(":", 3)
-            page = int(page_str)
-            query = urllib.parse.unquote(encoded_query) if encoded_query else ""
-            text_out, keyboard = analytics_text(None, page=page, query=query)
             api(
                 "editMessageText",
                 chat_id=cq["message"]["chat"]["id"],
