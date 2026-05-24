@@ -97,6 +97,18 @@ def start_health_server():
     logging.info(f"Healthcheck server started on port {PORT}")
 
 
+def start_cleanup_worker():
+    def worker():
+        while True:
+            try:
+                db.cleanup_temp_tables()
+            except Exception as exc:
+                logging.error("Cleanup error: %s", exc)
+            time.sleep(24 * 60 * 60)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def get_settings(user_id: int) -> dict:
     return db.get_user_settings(user_id)
 
@@ -322,7 +334,7 @@ def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
     header = "👥 <b>Пользователи:</b>\n"
     if query:
         header += f"🔎 Поиск: <code>{query}</code>\n"
-    header += f"📄 Страница {page}/{total_pages} · Всего: {total}\n\n"
+    header += f"📄 Страница {page}/{total_pages} · Всего: {total} · Подключены: {db.get_connections_count()}\n\n"
 
     if not chunk:
         text = header + "Ничего не найдено."
@@ -331,12 +343,6 @@ def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
 
     encoded_query = urllib.parse.quote(query) if query else ""
     keyboard_rows = []
-    for user in chunk:
-        display_name = user.get("first_name") or user.get("username") or str(user["user_id"])
-        keyboard_rows.append([{
-            "text": f"👤 {display_name[:24]}",
-            "callback_data": f"users:{page}:{encoded_query}",
-        }])
     keyboard_rows.append([
         {"text": "🎁 Реферальная программа", "callback_data": f"users:ref:{page}:{encoded_query}"},
     ])
@@ -930,8 +936,8 @@ def handle_update(update: dict):
                 f"/sub @user monthly|yearly|trial — выдать подписку\n"
                 f"/ban user_id|@user — забанить пользователя\n"
                 f"/unban user_id|@user — разбанить и дать 14 дней trial\n"
-                f"/users [user_id|@user] — список пользователей, поиск и страницы\n"
-                f"Кнопка в /users: 🎁 реферальная программа и 📊 аналитика\n"
+                f"/users [user_id|@user] — список пользователей и поиск\n"
+                f"Кнопка в /users: 🎁 реферальная программа\n"
                 f"/reply user_id текст — ответить в поддержку вручную\n"
                 f"reply на сообщение пользователя — быстрый ответ в поддержку\n"
                 f"/refund user_id|@user telegram_payment_charge_id — вернуть Stars\n"
@@ -939,7 +945,6 @@ def handle_update(update: dict):
                 f"/closesupport user_id|@user — закрыть диалог поддержки\n"
                 f"/supportlist — активные диалоги поддержки\n"
                 f"/payments user_id|@user — последние платежи пользователя\n"
-                f"/analytics — аналитика активности и удалений\n"
                 f"/bd [текст] — рассылка всем пользователям (alias /broadcast)\n"
                 f"/bdsub [текст] — рассылка только активным подписчикам\n"
                 f"/bdconn [текст] — рассылка только подключённым\n"
@@ -1056,10 +1061,6 @@ def handle_update(update: dict):
             text_out, keyboard = users_page_text_and_keyboard(users, page=1, query=query)
             send(chat_id, text_out, keyboard=keyboard)
 
-        elif text == "/analytics" and user_id == ADMIN_ID:
-            text_out, keyboard = analytics_text(None, page=1, query="")
-            send(chat_id, text_out, keyboard=keyboard)
-
     # ── Callback кнопки ────────────────────────────────────
     elif "callback_query" in update:
         cq = update["callback_query"]
@@ -1137,8 +1138,11 @@ def handle_update(update: dict):
         is_enabled = bc.get("is_enabled", False)
         db.save_connection(bc["id"], owner_id, is_enabled)
         if is_enabled:
+            db.resume_subscription(owner_id)
             send(owner_id, "✅ <b>Бот подключён!</b>\n\nБуду присылать уведомления об удалённых и изменённых сообщениях.", keyboard=main_keyboard())
         else:
+            if db.get_connections_count_for_user(owner_id) == 0:
+                db.pause_subscription(owner_id)
             send(owner_id, "❌ Бот отключён.", keyboard=main_keyboard())
 
     # ── Новое сообщение из бизнес-чата ────────────────────
@@ -1153,36 +1157,21 @@ def handle_update(update: dict):
 
         date_str = format_ts_msk(msg["date"])
         sender_link = get_user_link(sender)
-        chat = msg.get("chat", {})
-        chat_name = chat.get("title") or chat.get("first_name") or chat.get("username") or str(chat.get("id", ""))
-        sender_name = sender.get("first_name") or sender.get("username") or sender.get("last_name") or "Без имени"
-        message_date = datetime.fromtimestamp(msg["date"], MSK).replace(tzinfo=None)
-        sender_id = sender.get("id")
-        sender_username = sender.get("username", "")
-
         if msg.get("text"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "text", message_date)
             db.cache_message(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, msg["text"], date_str)
         elif msg.get("voice"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "voice", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "voice", msg["voice"]["file_id"], date_str)
         elif msg.get("video_note"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "video_note", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "video_note", msg["video_note"]["file_id"], date_str)
         elif msg.get("audio"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "audio", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "audio", msg["audio"]["file_id"], date_str)
         elif msg.get("photo"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "photo", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "photo", msg["photo"][-1]["file_id"], date_str)
         elif msg.get("video"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "video", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "video", msg["video"]["file_id"], date_str)
         elif msg.get("document"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "document", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "document", msg["document"]["file_id"], date_str)
         elif msg.get("sticker"):
-            db.save_message_event(owner_id, conn_id, msg["chat"]["id"], chat_name, sender_id, sender_username, sender_name, msg["message_id"], "sticker", message_date)
             db.cache_media(conn_id, msg["chat"]["id"], msg["message_id"], sender_link, "sticker", msg["sticker"]["file_id"], date_str)
 
     # ── Изменённое сообщение ───────────────────────────────
@@ -1210,7 +1199,6 @@ def handle_update(update: dict):
                 f"<b>Стало:</b>\n{new_text}"
             )
             db.update_cached_text(conn_id, msg["chat"]["id"], msg["message_id"], new_text)
-            db.mark_message_event_edited(conn_id, msg["chat"]["id"], msg["message_id"])
 
     # ── Удалённые сообщения ────────────────────────────────
     elif "deleted_business_messages" in update:
@@ -1238,7 +1226,6 @@ def handle_update(update: dict):
                     f"<b>Текст:</b>\n{original['text']}"
                 )
                 db.delete_cached_message(conn_id, event["chat"]["id"], msg_id)
-                db.mark_message_event_deleted(conn_id, event["chat"]["id"], msg_id)
                 continue
 
             media = db.get_cached_media(conn_id, event["chat"]["id"], msg_id)
@@ -1246,7 +1233,6 @@ def handle_update(update: dict):
                 caption = f"🗑️ <b>Удалено</b> · {media['file_type']}\n👤 {chat_link}\n🕐 {media['date']}"
                 send_file(owner_id, media["file_id"], media["file_type"], caption)
                 db.delete_cached_media(conn_id, event["chat"]["id"], msg_id)
-            db.mark_message_event_deleted(conn_id, event["chat"]["id"], msg_id)
 
 
 def main():
@@ -1257,7 +1243,9 @@ def main():
         raise RuntimeError("DATABASE_URL is not set")
 
     db.init_db()
+    db.cleanup_temp_tables()
     start_health_server()
+    start_cleanup_worker()
 
     api("deleteWebhook", drop_pending_updates=False)
 
