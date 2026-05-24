@@ -330,6 +330,13 @@ def users_page_text_and_keyboard(users: list[dict], page: int, query: str = ""):
         text = header + "\n".join(render_user_line(user) for user in chunk)
 
     encoded_query = urllib.parse.quote(query) if query else ""
+    keyboard_rows = []
+    for user in chunk:
+        display_name = user.get("first_name") or user.get("username") or str(user["user_id"])
+        keyboard_rows.append([{
+            "text": f"👤 {display_name[:24]}",
+            "callback_data": f"users:{page}:{encoded_query}",
+        }])
     keyboard_rows.append([
         {"text": "🎁 Реферальная программа", "callback_data": f"users:ref:{page}:{encoded_query}"},
     ])
