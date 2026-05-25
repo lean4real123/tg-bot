@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-*.session
-spy.db
-sessions/
-.env
