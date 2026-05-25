@@ -71,6 +71,26 @@ ALLOWED_UPDATES = [
 
 BOT_USERNAME = ""
 MSK = ZoneInfo("Europe/Moscow")
+BUSINESS_RATE_LIMIT_PER_MINUTE = int(os.getenv("BUSINESS_RATE_LIMIT_PER_MINUTE", "120"))
+_BUSINESS_RATE_BUCKETS = {}
+
+
+def allow_business_event(owner_id: int, connection_id: str) -> bool:
+    now = int(time.time())
+    window = now // 60
+    key = (owner_id, connection_id, window)
+    current = _BUSINESS_RATE_BUCKETS.get(key, 0)
+    if current >= BUSINESS_RATE_LIMIT_PER_MINUTE:
+        if current == BUSINESS_RATE_LIMIT_PER_MINUTE:
+            logging.warning("Business event rate limited owner_id=%s connection_id=%s", owner_id, connection_id)
+        _BUSINESS_RATE_BUCKETS[key] = current + 1
+        return False
+    _BUSINESS_RATE_BUCKETS[key] = current + 1
+    if len(_BUSINESS_RATE_BUCKETS) > 5000:
+        stale_windows = {bucket_key for bucket_key in _BUSINESS_RATE_BUCKETS if bucket_key[2] < window - 2}
+        for bucket_key in stale_windows:
+            _BUSINESS_RATE_BUCKETS.pop(bucket_key, None)
+    return True
 
 
 def format_ts_msk(unix_ts: int) -> str:
@@ -1335,6 +1355,8 @@ def handle_update(update: dict):
 
         if sender.get("id") == owner_id or msg["chat"]["id"] == owner_id:
             return
+        if not allow_business_event(owner_id, conn_id):
+            return
 
         date_str = format_ts_msk(msg["date"])
         sender_link = get_user_link(sender)
@@ -1369,6 +1391,8 @@ def handle_update(update: dict):
         s = get_settings(owner_id)
         if not s["track_edited"]:
             return
+        if not allow_business_event(owner_id, conn_id):
+            return
 
         original = db.get_cached_message(conn_id, msg["chat"]["id"], msg["message_id"])
         if original and original["text"] != new_text:
@@ -1393,6 +1417,8 @@ def handle_update(update: dict):
 
         s = get_settings(owner_id)
         if not s["track_deleted"]:
+            return
+        if not allow_business_event(owner_id, conn_id):
             return
 
         chat_link = get_chat_link(event["chat"])

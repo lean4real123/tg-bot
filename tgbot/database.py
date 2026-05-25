@@ -1,4 +1,4 @@
-"""PostgreSQL helpers for the bot."""
+﻿"""PostgreSQL helpers for the bot."""
 
 import base64
 import hashlib
@@ -6,15 +6,20 @@ import logging
 import os
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import SimpleConnectionPool
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet, InvalidToken
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 APP_MASTER_KEY = os.environ.get("APP_MASTER_KEY", "").strip()
+DB_POOL_MIN_CONN = int(os.environ.get("DB_POOL_MIN_CONN", "1"))
+DB_POOL_MAX_CONN = int(os.environ.get("DB_POOL_MAX_CONN", "5"))
+MAX_CACHED_TEXT_LENGTH = int(os.environ.get("MAX_CACHED_TEXT_LENGTH", "4000"))
 MSK = ZoneInfo("Europe/Moscow")
 ENCRYPTION_PREFIX = "enc:"
 _FERNET = None
+_POOL = None
 
 
 def now_msk() -> datetime:
@@ -22,7 +27,31 @@ def now_msk() -> datetime:
 
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    global _POOL
+    if _POOL is None:
+        _POOL = SimpleConnectionPool(DB_POOL_MIN_CONN, DB_POOL_MAX_CONN, DATABASE_URL, sslmode="require")
+    return _POOL.getconn()
+
+
+def release_conn(conn):
+    if conn is None:
+        return
+    global _POOL
+    if _POOL is None:
+        conn.close()
+        return
+    if conn.closed:
+        return
+    _POOL.putconn(conn)
+
+
+def truncate_cached_text(text: str) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= MAX_CACHED_TEXT_LENGTH:
+        return text
+    return text[:MAX_CACHED_TEXT_LENGTH] + "\n\n... [truncated]"
 
 
 def _get_fernet() -> Fernet:
@@ -254,10 +283,10 @@ def init_db():
         """, (encrypt_value(sender_name), encrypt_value(file_id), row_id))
 
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
-# ── Пользователи ──────────────────────────────────────────
+# в”Ђв”Ђ РџРѕР»СЊР·РѕРІР°С‚РµР»Рё в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def save_user(user_id: int, username: str, first_name: str = ""):
     conn = get_conn()
@@ -270,7 +299,7 @@ def save_user(user_id: int, username: str, first_name: str = ""):
             first_name = EXCLUDED.first_name
     """, (user_id, username or "", first_name or "", 14 * 24 * 60 * 60))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_user(user_id: int):
@@ -278,7 +307,7 @@ def get_user(user_id: int):
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     return dict(row) if row else None
 
 
@@ -287,7 +316,7 @@ def get_all_users():
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     c.execute("SELECT * FROM users ORDER BY created_at DESC")
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [dict(r) for r in rows]
 
 
@@ -302,7 +331,7 @@ def get_users_with_active_support():
         ORDER BY us.updated_at DESC
     """)
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [dict(r) for r in rows]
 
 
@@ -321,7 +350,7 @@ def set_subscription(user_id: int, sub_type: str, days: int):
             WHERE user_id = %s
         """, (sub_type, user_id))
         conn.commit()
-        conn.close()
+        release_conn(conn)
         return
     if active_connections:
         expires = now_msk() + timedelta(seconds=remaining_seconds)
@@ -336,11 +365,11 @@ def set_subscription(user_id: int, sub_type: str, days: int):
         WHERE user_id = %s
     """, (sub_type, expires, remaining_seconds, user_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def add_days(user_id: int, days: int):
-    """Добавить дни к текущей подписке"""
+    """Р”РѕР±Р°РІРёС‚СЊ РґРЅРё Рє С‚РµРєСѓС‰РµР№ РїРѕРґРїРёСЃРєРµ"""
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
@@ -361,20 +390,20 @@ def add_days(user_id: int, days: int):
             WHERE user_id = %s AND sub_type != 'banned'
         """, (days, user_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def is_sub_active(user_id: int) -> bool:
     user = get_user(user_id)
     if not user:
-        return True  # новый пользователь — разрешаем
+        return True  # РЅРѕРІС‹Р№ РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ вЂ” СЂР°Р·СЂРµС€Р°РµРј
     if user["sub_type"] == "banned":
         return False
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
     active_connections = c.fetchone()[0]
-    conn.close()
+    release_conn(conn)
     if not active_connections:
         return False
     if not user["sub_expires"]:
@@ -404,7 +433,7 @@ def pause_subscription(user_id: int):
         WHERE user_id = %s
     """, (remaining_seconds, user_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def resume_subscription(user_id: int):
@@ -423,7 +452,7 @@ def resume_subscription(user_id: int):
         WHERE user_id = %s
     """, (now_msk() + timedelta(seconds=remaining_seconds), user_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def cleanup_temp_tables():
@@ -442,7 +471,7 @@ def cleanup_temp_tables():
         WHERE created_at < NOW() - INTERVAL '7 days'
     """)
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_user_settings(user_id: int):
@@ -461,7 +490,7 @@ def get_user_settings(user_id: int):
     """, (user_id,))
     row = c.fetchone()
     conn.commit()
-    conn.close()
+    release_conn(conn)
     return dict(row) if row else {
         "track_deleted": True,
         "track_edited": True,
@@ -492,7 +521,7 @@ def save_user_settings(
             updated_at = NOW()
     """, (user_id, track_deleted, track_edited, support_mode, support_active))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def save_payment(
@@ -526,7 +555,7 @@ def save_payment(
         provider_payment_charge_id or "",
     ))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_payment(telegram_payment_charge_id: str):
@@ -537,7 +566,7 @@ def get_payment(telegram_payment_charge_id: str):
         WHERE telegram_payment_charge_id = %s
     """, (telegram_payment_charge_id,))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     return dict(row) if row else None
 
 
@@ -552,7 +581,7 @@ def get_payments_by_user(user_id: int, limit: int = 10):
         LIMIT %s
     """, (user_id, limit))
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [dict(r) for r in rows]
 
 
@@ -565,7 +594,7 @@ def get_payments_count_by_user(user_id: int) -> int:
         WHERE user_id = %s
     """, (user_id,))
     count = c.fetchone()[0]
-    conn.close()
+    release_conn(conn)
     return count
 
 
@@ -578,7 +607,7 @@ def mark_payment_refunded(telegram_payment_charge_id: str):
         WHERE telegram_payment_charge_id = %s
     """, (telegram_payment_charge_id,))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def save_support_message_link(admin_message_id: int, user_id: int):
@@ -591,7 +620,7 @@ def save_support_message_link(admin_message_id: int, user_id: int):
             user_id = EXCLUDED.user_id
     """, (admin_message_id, user_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_support_message_link(admin_message_id: int):
@@ -603,11 +632,11 @@ def get_support_message_link(admin_message_id: int):
         WHERE admin_message_id = %s
     """, (admin_message_id,))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     return row[0] if row else None
 
 
-# ── Бизнес-подключения ────────────────────────────────────
+# в”Ђв”Ђ Р‘РёР·РЅРµСЃ-РїРѕРґРєР»СЋС‡РµРЅРёСЏ в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def save_connection(connection_id: str, owner_id: int, is_enabled: bool):
     conn = get_conn()
@@ -619,7 +648,7 @@ def save_connection(connection_id: str, owner_id: int, is_enabled: bool):
             is_enabled = EXCLUDED.is_enabled
     """, (connection_id, owner_id, int(is_enabled)))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_owner_by_connection(connection_id: str):
@@ -627,7 +656,7 @@ def get_owner_by_connection(connection_id: str):
     c = conn.cursor()
     c.execute("SELECT owner_id FROM connections WHERE connection_id = %s", (connection_id,))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     return row[0] if row else None
 
 
@@ -636,7 +665,7 @@ def get_connections_count() -> int:
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM connections WHERE is_enabled = 1")
     count = c.fetchone()[0]
-    conn.close()
+    release_conn(conn)
     return count
 
 
@@ -647,7 +676,7 @@ def get_connections_count_for_user(user_id: int) -> int:
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM connections WHERE owner_id = %s AND is_enabled = 1", (user_id,))
     count = c.fetchone()[0]
-    conn.close()
+    release_conn(conn)
     return count
 
 
@@ -656,7 +685,7 @@ def get_connected_owner_ids():
     c = conn.cursor()
     c.execute("SELECT DISTINCT owner_id FROM connections WHERE is_enabled = 1")
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [row[0] for row in rows]
 
 
@@ -672,14 +701,14 @@ def get_recent_connections(limit: int = 10):
         LIMIT %s
     """, (limit,))
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [dict(r) for r in rows]
 
 
-# ── Реферальная система ───────────────────────────────────
+# в”Ђв”Ђ Р РµС„РµСЂР°Р»СЊРЅР°СЏ СЃРёСЃС‚РµРјР° в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def add_referral(referrer_id: int, referred_id: int) -> bool:
-    """Добавить реферала. Возвращает True если новый."""
+    """Р”РѕР±Р°РІРёС‚СЊ СЂРµС„РµСЂР°Р»Р°. Р’РѕР·РІСЂР°С‰Р°РµС‚ True РµСЃР»Рё РЅРѕРІС‹Р№."""
     conn = get_conn()
     c = conn.cursor()
     try:
@@ -695,7 +724,7 @@ def add_referral(referrer_id: int, referred_id: int) -> bool:
         conn.rollback()
         return False
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def get_referral_count(user_id: int) -> int:
@@ -703,7 +732,7 @@ def get_referral_count(user_id: int) -> int:
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
     count = c.fetchone()[0]
-    conn.close()
+    release_conn(conn)
     return count
 
 
@@ -722,7 +751,7 @@ def get_referral_leaderboard(limit: int = 20):
         LIMIT %s
     """, (limit,))
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [dict(r) for r in rows]
 
 
@@ -737,7 +766,7 @@ def get_referrals_by_referrer(user_id: int):
         ORDER BY r.created_at DESC
     """, (user_id,))
     rows = c.fetchall()
-    conn.close()
+    release_conn(conn)
     return [dict(r) for r in rows]
 
 
@@ -746,11 +775,11 @@ def get_referrer_for_user(user_id: int):
     c = conn.cursor()
     c.execute("SELECT referrer_id FROM referrals WHERE referred_id = %s", (user_id,))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     return row[0] if row else None
 
 
-# ── Кэш текстовых сообщений ───────────────────────────────
+# в”Ђв”Ђ РљСЌС€ С‚РµРєСЃС‚РѕРІС‹С… СЃРѕРѕР±С‰РµРЅРёР№ в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def cache_message(connection_id: str, chat_id: int, msg_id: int,
                   sender_name: str, text: str, date: str):
@@ -768,11 +797,11 @@ def cache_message(connection_id: str, chat_id: int, msg_id: int,
         chat_id,
         msg_id,
         encrypt_value(sender_name),
-        encrypt_value(text),
+        encrypt_value(truncate_cached_text(text)),
         date,
     ))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_cached_message(connection_id: str, chat_id: int, msg_id: int):
@@ -783,7 +812,7 @@ def get_cached_message(connection_id: str, chat_id: int, msg_id: int):
         WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
     """, (connection_id, chat_id, msg_id))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     if not row:
         return None
     result = dict(row)
@@ -798,9 +827,9 @@ def update_cached_text(connection_id: str, chat_id: int, msg_id: int, new_text: 
     c.execute("""
         UPDATE message_cache SET text = %s
         WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (encrypt_value(new_text), connection_id, chat_id, msg_id))
+    """, (encrypt_value(truncate_cached_text(new_text)), connection_id, chat_id, msg_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def delete_cached_message(connection_id: str, chat_id: int, msg_id: int):
@@ -811,10 +840,10 @@ def delete_cached_message(connection_id: str, chat_id: int, msg_id: int):
         WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
     """, (connection_id, chat_id, msg_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
-# ── Кэш медиа ─────────────────────────────────────────────
+# в”Ђв”Ђ РљСЌС€ РјРµРґРёР° в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def cache_media(connection_id: str, chat_id: int, msg_id: int,
                 sender_name: str, file_type: str, file_id: str, date: str):
@@ -834,7 +863,7 @@ def cache_media(connection_id: str, chat_id: int, msg_id: int,
         date,
     ))
     conn.commit()
-    conn.close()
+    release_conn(conn)
 
 
 def get_cached_media(connection_id: str, chat_id: int, msg_id: int):
@@ -845,7 +874,7 @@ def get_cached_media(connection_id: str, chat_id: int, msg_id: int):
         WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
     """, (connection_id, chat_id, msg_id))
     row = c.fetchone()
-    conn.close()
+    release_conn(conn)
     if not row:
         return None
     result = dict(row)
@@ -862,4 +891,4 @@ def delete_cached_media(connection_id: str, chat_id: int, msg_id: int):
         WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
     """, (connection_id, chat_id, msg_id))
     conn.commit()
-    conn.close()
+    release_conn(conn)
