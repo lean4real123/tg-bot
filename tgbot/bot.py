@@ -576,7 +576,10 @@ def send_expired_message(user_id: int):
         "Для продолжения выберите вариант:\n\n"
         f"👥 <b>Пригласи друга</b> — получи +3 дня бесплатно\n"
         f"Приглашено: {ref_count} чел.\n\n"
-        "💳 <b>Или купи подписку через YooKassa / карту / СБП:</b>",
+        "💳 <b>Или купи подписку через YooKassa / карту / СБП:</b>\n"
+        f"• 7 дней — {RUB_PRICE_WEEKLY} ₽\n"
+        f"• 30 дней — {RUB_PRICE_MONTHLY} ₽\n"
+        f"• 365 дней — {RUB_PRICE_YEARLY} ₽",
         keyboard={
             "inline_keyboard": [
                 [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
@@ -993,7 +996,11 @@ def handle_update(update: dict):
                 f"⭐ 30 дней — {PRICE_MONTHLY} Telegram Stars\n"
                 f"⭐ 365 дней — {PRICE_YEARLY} Telegram Stars\n\n"
                 "Оплата через Telegram Stars — мгновенно и безопасно.\n"
-                + ("Есть внешний checkout через YooKassa." if any((weekly_url, monthly_url, yearly_url)) else ""),
+                f"\n💳 Через YooKassa / карту / СБП:\n"
+                f"• 7 дней — {RUB_PRICE_WEEKLY} ₽\n"
+                f"• 30 дней — {RUB_PRICE_MONTHLY} ₽\n"
+                f"• 365 дней — {RUB_PRICE_YEARLY} ₽\n"
+                + ("\nЕсть внешний checkout через YooKassa." if any((weekly_url, monthly_url, yearly_url)) else "\nYooKassa появится после подключения магазина."),
                 keyboard={
                     "inline_keyboard": [
                         [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
