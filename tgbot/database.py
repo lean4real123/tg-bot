@@ -174,6 +174,23 @@ def init_db():
         ADD COLUMN IF NOT EXISTS sub_remaining_seconds INTEGER DEFAULT 0
     """)
 
+    c.execute("""
+        ALTER TABLE message_cache
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+    """)
+    c.execute("""
+        ALTER TABLE media_cache
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+    """)
+    c.execute("""
+        UPDATE message_cache
+        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
+    """)
+    c.execute("""
+        UPDATE media_cache
+        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
+    """)
+
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_sub_type ON users (sub_type)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_created_at ON users (created_at DESC)")
@@ -192,23 +209,6 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_created_at ON message_cache (created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_created_at ON media_cache (created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_support_links_created_at ON support_message_links (created_at)")
-
-    c.execute("""
-        ALTER TABLE message_cache
-        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
-    """)
-    c.execute("""
-        ALTER TABLE media_cache
-        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
-    """)
-    c.execute("""
-        UPDATE message_cache
-        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
-    """)
-    c.execute("""
-        UPDATE media_cache
-        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
-    """)
 
     c.execute("""
         UPDATE users
