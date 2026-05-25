@@ -1,13 +1,20 @@
 """PostgreSQL helpers for the bot."""
 
+import base64
+import hashlib
+import logging
 import os
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from cryptography.fernet import Fernet, InvalidToken
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+APP_MASTER_KEY = os.environ.get("APP_MASTER_KEY", "").strip()
 MSK = ZoneInfo("Europe/Moscow")
+ENCRYPTION_PREFIX = "enc:"
+_FERNET = None
 
 
 def now_msk() -> datetime:
@@ -18,7 +25,44 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
+def _get_fernet() -> Fernet:
+    global _FERNET
+    if _FERNET is None:
+        if not APP_MASTER_KEY:
+            raise RuntimeError("APP_MASTER_KEY is not set")
+        digest = hashlib.sha256(APP_MASTER_KEY.encode("utf-8")).digest()
+        key = base64.urlsafe_b64encode(digest)
+        _FERNET = Fernet(key)
+    return _FERNET
+
+
+def encrypt_value(value):
+    if value is None:
+        return None
+    text = str(value)
+    if text.startswith(ENCRYPTION_PREFIX):
+        return text
+    token = _get_fernet().encrypt(text.encode("utf-8")).decode("ascii")
+    return ENCRYPTION_PREFIX + token
+
+
+def decrypt_value(value):
+    if value is None:
+        return None
+    text = str(value)
+    if not text.startswith(ENCRYPTION_PREFIX):
+        return text
+    token = text[len(ENCRYPTION_PREFIX):]
+    try:
+        return _get_fernet().decrypt(token.encode("ascii")).decode("utf-8")
+    except InvalidToken:
+        logging.error("Failed to decrypt cached value")
+        return text
+
+
 def init_db():
+    if not APP_MASTER_KEY:
+        raise RuntimeError("APP_MASTER_KEY is not set")
     conn = get_conn()
     c = conn.cursor()
 
@@ -52,6 +96,7 @@ def init_db():
             sender_name     TEXT,
             text            TEXT,
             date            TEXT,
+            created_at      TIMESTAMP DEFAULT NOW(),
             UNIQUE(connection_id, chat_id, msg_id)
         )
     """)
@@ -66,6 +111,7 @@ def init_db():
             file_type       TEXT,
             file_id         TEXT,
             date            TEXT,
+            created_at      TIMESTAMP DEFAULT NOW(),
             UNIQUE(connection_id, chat_id, msg_id)
         )
     """)
@@ -143,7 +189,26 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_lookup ON media_cache (connection_id, chat_id, msg_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_date ON message_cache (date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_date ON media_cache (date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_message_cache_created_at ON message_cache (created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_media_cache_created_at ON media_cache (created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_support_links_created_at ON support_message_links (created_at)")
+
+    c.execute("""
+        ALTER TABLE message_cache
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+    """)
+    c.execute("""
+        ALTER TABLE media_cache
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()
+    """)
+    c.execute("""
+        UPDATE message_cache
+        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
+    """)
+    c.execute("""
+        UPDATE media_cache
+        SET created_at = COALESCE(created_at, to_timestamp(date, 'DD.MM.YYYY HH24:MI'), NOW())
+    """)
 
     c.execute("""
         UPDATE users
@@ -159,6 +224,34 @@ def init_db():
               WHERE c.owner_id = users.user_id AND c.is_enabled = 1
           )
     """)
+
+    c.execute("""
+        SELECT id, sender_name, text
+        FROM message_cache
+        WHERE text IS NOT NULL AND text NOT LIKE %s
+    """, (ENCRYPTION_PREFIX + "%",))
+    rows = c.fetchall()
+    for row_id, sender_name, text in rows:
+        c.execute("""
+            UPDATE message_cache
+            SET sender_name = %s,
+                text = %s
+            WHERE id = %s
+        """, (encrypt_value(sender_name), encrypt_value(text), row_id))
+
+    c.execute("""
+        SELECT id, sender_name, file_id
+        FROM media_cache
+        WHERE file_id IS NOT NULL AND file_id NOT LIKE %s
+    """, (ENCRYPTION_PREFIX + "%",))
+    rows = c.fetchall()
+    for row_id, sender_name, file_id in rows:
+        c.execute("""
+            UPDATE media_cache
+            SET sender_name = %s,
+                file_id = %s
+            WHERE id = %s
+        """, (encrypt_value(sender_name), encrypt_value(file_id), row_id))
 
     conn.commit()
     conn.close()
@@ -338,11 +431,11 @@ def cleanup_temp_tables():
     c = conn.cursor()
     c.execute("""
         DELETE FROM message_cache
-        WHERE to_timestamp(date, 'DD.MM.YYYY HH24:MI') < NOW() - INTERVAL '14 days'
+        WHERE created_at < NOW() - INTERVAL '14 days'
     """)
     c.execute("""
         DELETE FROM media_cache
-        WHERE to_timestamp(date, 'DD.MM.YYYY HH24:MI') < NOW() - INTERVAL '14 days'
+        WHERE created_at < NOW() - INTERVAL '14 days'
     """)
     c.execute("""
         DELETE FROM support_message_links
@@ -664,12 +757,20 @@ def cache_message(connection_id: str, chat_id: int, msg_id: int,
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO message_cache (connection_id, chat_id, msg_id, sender_name, text, date)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO message_cache (connection_id, chat_id, msg_id, sender_name, text, date, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT(connection_id, chat_id, msg_id) DO UPDATE SET
             text = EXCLUDED.text,
-            sender_name = EXCLUDED.sender_name
-    """, (connection_id, chat_id, msg_id, sender_name, text, date))
+            sender_name = EXCLUDED.sender_name,
+            date = EXCLUDED.date
+    """, (
+        connection_id,
+        chat_id,
+        msg_id,
+        encrypt_value(sender_name),
+        encrypt_value(text),
+        date,
+    ))
     conn.commit()
     conn.close()
 
@@ -683,7 +784,12 @@ def get_cached_message(connection_id: str, chat_id: int, msg_id: int):
     """, (connection_id, chat_id, msg_id))
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["sender_name"] = decrypt_value(result.get("sender_name"))
+    result["text"] = decrypt_value(result.get("text"))
+    return result
 
 
 def update_cached_text(connection_id: str, chat_id: int, msg_id: int, new_text: str):
@@ -692,7 +798,7 @@ def update_cached_text(connection_id: str, chat_id: int, msg_id: int, new_text: 
     c.execute("""
         UPDATE message_cache SET text = %s
         WHERE connection_id = %s AND chat_id = %s AND msg_id = %s
-    """, (new_text, connection_id, chat_id, msg_id))
+    """, (encrypt_value(new_text), connection_id, chat_id, msg_id))
     conn.commit()
     conn.close()
 
@@ -715,10 +821,18 @@ def cache_media(connection_id: str, chat_id: int, msg_id: int,
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO media_cache (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO media_cache (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT(connection_id, chat_id, msg_id) DO NOTHING
-    """, (connection_id, chat_id, msg_id, sender_name, file_type, file_id, date))
+    """, (
+        connection_id,
+        chat_id,
+        msg_id,
+        encrypt_value(sender_name),
+        file_type,
+        encrypt_value(file_id),
+        date,
+    ))
     conn.commit()
     conn.close()
 
@@ -732,7 +846,12 @@ def get_cached_media(connection_id: str, chat_id: int, msg_id: int):
     """, (connection_id, chat_id, msg_id))
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["sender_name"] = decrypt_value(result.get("sender_name"))
+    result["file_id"] = decrypt_value(result.get("file_id"))
+    return result
 
 
 def delete_cached_media(connection_id: str, chat_id: int, msg_id: int):
