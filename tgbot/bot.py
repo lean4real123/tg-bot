@@ -27,6 +27,10 @@ INSTRUCTION_IMAGE_PATHS = [
     os.path.join(os.path.dirname(__file__), "instruction.jpg"),
     os.path.join(os.path.dirname(__file__), "instruction.png"),
 ]
+PRIVACY_IMAGE_PATHS = [
+    os.path.join(os.path.dirname(__file__), "privacy.jpg"),
+    os.path.join(os.path.dirname(__file__), "privacy.png"),
+]
 
 # Prices in Telegram Stars
 PRICE_WEEKLY = 45
@@ -1033,20 +1037,25 @@ def handle_update(update: dict):
             )
 
         elif text in ("🔒 Приватность",):
-            send(chat_id,
+            privacy_caption = (
                 "🔒 <b>Приватность и безопасность</b>\n\n"
                 "✅ Бот работает через <b>официальный Telegram Bot API</b>\n"
                 "✅ Уведомления об удалённых и изменённых сообщениях приходят <b>только тебе</b>\n"
-                "✅ Тексты сообщений и file_id хранятся в БД <b>только в зашифрованном виде</b>\n"
-                "✅ В базе нет читаемого текста сообщений — только шифротекст\n"
+                "✅ Тексты сообщений и file_id хранятся только в зашифрованном виде\n"
+                "✅ В базе данных нет читаемых переписок\n"
                 "✅ Ключ шифрования хранится отдельно от БД\n"
                 "✅ Логи не содержат содержимое сообщений\n"
-                "✅ Бот сохраняет только имена и username для статистики и поиска\n"
-                "✅ Ты можешь в любой момент отключить бота и перестать получать события\n\n"
-                "<b>Как отключить:</b>\n"
-                "Профиль → Изм. → Автоматизация чатов → удалить бота\n\n",
-                keyboard=main_keyboard()
+                "✅ Бота можно отключить в любой момент\n\n"
             )
+            privacy_image_path = next((path for path in PRIVACY_IMAGE_PATHS if os.path.exists(path)), None)
+            if privacy_image_path:
+                send_photo(chat_id, privacy_image_path, caption=privacy_caption, keyboard=main_keyboard())
+            else:
+                send(
+                    chat_id,
+                    privacy_caption + "\n\n<i>Положи файл <code>privacy.jpg</code> или <code>privacy.png</code> рядом с ботом, и он будет отправляться как картинка.</i>",
+                    keyboard=main_keyboard()
+                )
 
         elif text in ("📖 Инструкция",):
             instruction_caption = (
