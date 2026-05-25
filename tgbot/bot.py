@@ -9,6 +9,7 @@ import logging
 import sys
 import os
 import threading
+import base64
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
@@ -16,6 +17,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(__file__))
 import database as db
 from config import BOT_TOKEN, ADMIN_ID, PORT
+from config import YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY, YOOKASSA_RETURN_URL
+from config import RUB_PRICE_WEEKLY, RUB_PRICE_MONTHLY, RUB_PRICE_YEARLY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
@@ -33,6 +36,11 @@ PAYMENT_PLANS = {
     "weekly": {"days": 7, "stars": PRICE_WEEKLY, "title": "Подписка 7 дней"},
     "monthly": {"days": 30, "stars": PRICE_MONTHLY, "title": "Подписка 30 дней"},
     "yearly": {"days": 365, "stars": PRICE_YEARLY, "title": "Подписка 365 дней"},
+}
+RUB_PAYMENT_PLANS = {
+    "weekly": {"rub": RUB_PRICE_WEEKLY, "title": "Подписка 7 дней"},
+    "monthly": {"rub": RUB_PRICE_MONTHLY, "title": "Подписка 30 дней"},
+    "yearly": {"rub": RUB_PRICE_YEARLY, "title": "Подписка 365 дней"},
 }
 MENU_ACTION_TEXTS = {
     "📊 Статус",
@@ -86,6 +94,55 @@ class HealthHandler(BaseHTTPRequestHandler):
 
         self.send_response(404)
         self.end_headers()
+
+    def do_POST(self):
+        parsed_path = urllib.parse.urlparse(self.path).path
+        if parsed_path not in ("/payment-webhook", "/external-payment-webhook", "/yookassa-webhook"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = self.rfile.read(length).decode("utf-8") if length else ""
+            data = json.loads(payload or "{}")
+            if parsed_path == "/yookassa-webhook":
+                if data.get("event") != "payment.succeeded":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+                payment = data.get("object", {})
+                payment_id = payment.get("id", "")
+                if not payment_id:
+                    raise ValueError("missing payment id")
+                payment_info = get_yookassa_payment(payment_id)
+                if payment_info.get("status") != "succeeded":
+                    raise ValueError("payment not succeeded")
+                metadata = payment_info.get("metadata", {}) or payment.get("metadata", {})
+                user_id = int(metadata.get("user_id", 0))
+                plan = str(metadata.get("plan", "")).strip()
+            else:
+                user_id = int(data.get("user_id", 0))
+                plan = str(data.get("plan", "")).strip()
+                if str(data.get("status", "")).lower() not in ("paid", "success", "succeeded", "ok"):
+                    raise ValueError("payment not successful")
+            payment_id = data.get("payment_id", "") or data.get("id", "")
+            plan_info = PAYMENT_PLANS.get(plan)
+            if not user_id or not plan_info:
+                raise ValueError("bad payload")
+            db.set_subscription(user_id, plan, plan_info["days"])
+            send(user_id, f"✅ <b>Оплата прошла!</b>\nПодписка на <b>{plan_info['days']} дней</b> активирована.", keyboard=main_keyboard())
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        except Exception as exc:
+            logging.error("Payment webhook error: %s", exc)
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"bad request")
 
     def log_message(self, format, *args):
         return
@@ -432,21 +489,101 @@ def get_ref_link(user_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
 
+def yookassa_api(method: str, payload: dict | None = None):
+    if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+        return {"ok": False}
+    url = f"https://api.yookassa.ru/v3/{method}"
+    data = json.dumps(payload or {}).encode("utf-8") if payload is not None else None
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotence-Key": str(int(time.time() * 1000)),
+    }
+    token = base64.b64encode(f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode("utf-8")).decode("ascii")
+    headers["Authorization"] = f"Basic {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read())
+    except Exception as exc:
+        logging.error("YooKassa API error on %s: %s", method, exc)
+        return {"ok": False}
+
+
+def get_yookassa_payment(payment_id: str):
+    if not payment_id:
+        return {}
+    url = f"https://api.yookassa.ru/v3/payments/{payment_id}"
+    headers = {}
+    token = base64.b64encode(f"{YOOKASSA_SHOP_ID}:{YOOKASSA_SECRET_KEY}".encode("utf-8")).decode("ascii")
+    headers["Authorization"] = f"Basic {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read())
+    except Exception as exc:
+        logging.error("YooKassa get payment error: %s", exc)
+        return {}
+
+
+def create_yookassa_checkout_url(user_id: int, plan: str) -> str | None:
+    if not (YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY):
+        return None
+    rub_plan = RUB_PAYMENT_PLANS.get(plan)
+    plan_info = PAYMENT_PLANS.get(plan)
+    if not rub_plan or not plan_info:
+        return None
+    return_url = YOOKASSA_RETURN_URL or "https://t.me/"
+    payload = {
+        "amount": {
+            "value": f"{rub_plan['rub']:.2f}",
+            "currency": "RUB",
+        },
+        "capture": True,
+        "confirmation": {
+            "type": "redirect",
+            "return_url": return_url,
+        },
+        "description": f"{plan_info['title']} — Dialog Spy Bot",
+        "metadata": {
+            "user_id": str(user_id),
+            "plan": plan,
+        },
+    }
+    response = yookassa_api("payments", payload)
+    confirmation = response.get("confirmation", {}) if isinstance(response, dict) else {}
+    return confirmation.get("confirmation_url")
+
+
+def get_external_checkout_url(user_id: int, plan: str) -> str | None:
+    return create_yookassa_checkout_url(user_id, plan)
+
+
 def send_expired_message(user_id: int):
     ref_link = get_ref_link(user_id)
     ref_count = db.get_referral_count(user_id)
+    weekly_url = get_external_checkout_url(user_id, "weekly")
+    monthly_url = get_external_checkout_url(user_id, "monthly")
+    yearly_url = get_external_checkout_url(user_id, "yearly")
+    sbp_rows = []
+    if weekly_url:
+        sbp_rows.append([{"text": f"💳 7 дней — {PRICE_WEEKLY} ₽", "url": weekly_url}])
+    if monthly_url:
+        sbp_rows.append([{"text": f"💳 30 дней — {PRICE_MONTHLY} ₽", "url": monthly_url}])
+    if yearly_url:
+        sbp_rows.append([{"text": f"💳 365 дней — {PRICE_YEARLY} ₽", "url": yearly_url}])
     send(user_id,
         "⏰ <b>Ваша подписка истекла</b>\n\n"
         "Для продолжения выберите вариант:\n\n"
         f"👥 <b>Пригласи друга</b> — получи +3 дня бесплатно\n"
         f"Приглашено: {ref_count} чел.\n\n"
-        "💳 <b>Или купи подписку за Telegram Stars:</b>",
+        "💳 <b>Или купи подписку через YooKassa / карту / СБП:</b>",
         keyboard={
             "inline_keyboard": [
                 [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
                 [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
                 [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
                 [{"text": "👥 Пригласить друга", "url": ref_link}],
+                *sbp_rows,
             ]
         }
     )
@@ -847,17 +984,24 @@ def handle_update(update: dict):
             send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
         elif text in ("💳 Купить подписку",):
+            weekly_url = get_external_checkout_url(user_id, "weekly")
+            monthly_url = get_external_checkout_url(user_id, "monthly")
+            yearly_url = get_external_checkout_url(user_id, "yearly")
             send(chat_id,
                 f"💳 <b>Купить подписку</b>\n\n"
                 f"⭐ 7 дней — {PRICE_WEEKLY} Telegram Stars\n"
                 f"⭐ 30 дней — {PRICE_MONTHLY} Telegram Stars\n"
                 f"⭐ 365 дней — {PRICE_YEARLY} Telegram Stars\n\n"
-                "Оплата через Telegram Stars — мгновенно и безопасно.",
+                "Оплата через Telegram Stars — мгновенно и безопасно.\n"
+                + ("Есть внешний checkout через YooKassa." if any((weekly_url, monthly_url, yearly_url)) else ""),
                 keyboard={
                     "inline_keyboard": [
                         [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
                         [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
                         [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
+                        *([[{"text": f"💳 7 дней — {PRICE_WEEKLY} ₽", "url": weekly_url}]] if weekly_url else []),
+                        *([[{"text": f"💳 30 дней — {PRICE_MONTHLY} ₽", "url": monthly_url}]] if monthly_url else []),
+                        *([[{"text": f"💳 365 дней — {PRICE_YEARLY} ₽", "url": yearly_url}]] if yearly_url else []),
                     ]
                 }
             )
