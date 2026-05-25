@@ -558,19 +558,13 @@ def get_external_checkout_url(user_id: int, plan: str) -> str | None:
     return create_yookassa_checkout_url(user_id, plan)
 
 
+def rub_payment_button(user_id: int, plan: str, days: int, price: int) -> dict:
+    return {"text": f"💳 {days} дней — {price} ₽", "callback_data": f"rub_{plan}"}
+
+
 def send_expired_message(user_id: int):
     ref_link = get_ref_link(user_id)
     ref_count = db.get_referral_count(user_id)
-    weekly_url = get_external_checkout_url(user_id, "weekly")
-    monthly_url = get_external_checkout_url(user_id, "monthly")
-    yearly_url = get_external_checkout_url(user_id, "yearly")
-    sbp_rows = []
-    if weekly_url:
-        sbp_rows.append([{"text": f"💳 7 дней — {PRICE_WEEKLY} ₽", "url": weekly_url}])
-    if monthly_url:
-        sbp_rows.append([{"text": f"💳 30 дней — {PRICE_MONTHLY} ₽", "url": monthly_url}])
-    if yearly_url:
-        sbp_rows.append([{"text": f"💳 365 дней — {PRICE_YEARLY} ₽", "url": yearly_url}])
     send(user_id,
         "⏰ <b>Ваша подписка истекла</b>\n\n"
         "Для продолжения выберите вариант:\n\n"
@@ -586,7 +580,9 @@ def send_expired_message(user_id: int):
                 [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
                 [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
                 [{"text": "👥 Пригласить друга", "url": ref_link}],
-                *sbp_rows,
+                [rub_payment_button(user_id, "weekly", 7, RUB_PRICE_WEEKLY)],
+                [rub_payment_button(user_id, "monthly", 30, RUB_PRICE_MONTHLY)],
+                [rub_payment_button(user_id, "yearly", 365, RUB_PRICE_YEARLY)],
             ]
         }
     )
@@ -987,9 +983,7 @@ def handle_update(update: dict):
             send(chat_id, "Главное меню:", keyboard=main_keyboard())
 
         elif text in ("💳 Купить подписку",):
-            weekly_url = get_external_checkout_url(user_id, "weekly")
-            monthly_url = get_external_checkout_url(user_id, "monthly")
-            yearly_url = get_external_checkout_url(user_id, "yearly")
+            weekly_url = monthly_url = yearly_url = bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
             send(chat_id,
                 f"💳 <b>Купить подписку</b>\n\n"
                 f"⭐ 7 дней — {PRICE_WEEKLY} Telegram Stars\n"
@@ -1006,9 +1000,9 @@ def handle_update(update: dict):
                         [{"text": f"⭐ 7 дней — {PRICE_WEEKLY} Stars", "callback_data": "buy_weekly"}],
                         [{"text": f"⭐ 30 дней — {PRICE_MONTHLY} Stars", "callback_data": "buy_monthly"}],
                         [{"text": f"⭐ 365 дней — {PRICE_YEARLY} Stars", "callback_data": "buy_yearly"}],
-                        *([[{"text": f"💳 7 дней — {PRICE_WEEKLY} ₽", "url": weekly_url}]] if weekly_url else []),
-                        *([[{"text": f"💳 30 дней — {PRICE_MONTHLY} ₽", "url": monthly_url}]] if monthly_url else []),
-                        *([[{"text": f"💳 365 дней — {PRICE_YEARLY} ₽", "url": yearly_url}]] if yearly_url else []),
+                        [rub_payment_button(user_id, "weekly", 7, RUB_PRICE_WEEKLY)],
+                        [rub_payment_button(user_id, "monthly", 30, RUB_PRICE_MONTHLY)],
+                        [rub_payment_button(user_id, "yearly", 365, RUB_PRICE_YEARLY)],
                     ]
                 }
             )
@@ -1256,6 +1250,20 @@ def handle_update(update: dict):
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
+        elif data.startswith("rub_"):
+            plan_key = data.replace("rub_", "", 1)
+            checkout_url = get_external_checkout_url(user_id, plan_key)
+            if checkout_url:
+                send(
+                    user_id,
+                    "💳 <b>Оплата через YooKassa</b>\n\nНажми кнопку ниже, чтобы оплатить картой или через СБП.",
+                    keyboard={"inline_keyboard": [[{"text": "💳 Перейти к оплате", "url": checkout_url}]]},
+                )
+            else:
+                send(
+                    user_id,
+                    "💳 Оплата в рублях скоро будет доступна.\n\nСейчас можно оплатить через Telegram Stars.",
+                )
         elif data == "buy_weekly":
             plan = PAYMENT_PLANS["weekly"]
             send_invoice(user_id, plan["title"], "Dialog Spy Bot — 7 дней доступа", "weekly", plan["stars"])
